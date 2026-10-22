@@ -1,23 +1,23 @@
 """Plot sliding-window LER vs p, one line per window config, with the run_sweep_v3 baseline overlaid.
 
-Reads results_sw/BB_<n>_ibm/p_*/sw_result.yaml and, for the cross-check,
-results/BB_<n>_ibm/d_*/<algo>/p_*/result_phy_err_*.yaml.
+Reads results_sw/BB_<n>_ibm/p_*/sw_result.yaml (written by run_sliding.py) and, for the
+cross-check, results/BB_<n>_ibm/d_*/<algo>/p_*/result_phy_err_*.yaml (run_sweep_v3.py).
 
-Usage (repo root): python dem_sw/plot_sliding.py --code 144 --algo bposd
+Usage (repo root): python plot_sliding.py --code 144
 """
 import argparse
 import glob
 import os
 import re
-import sys
 
 import matplotlib.pyplot as plt
 import yaml
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.dirname(HERE)
-sys.path.insert(0, REPO_ROOT)
-from plot_results_v3 import fast_extract_lers  # noqa: E402
+from plot_results_v3 import fast_extract_lers
+
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+# BP stage of the sliding-window decoder -> run_sweep_v3 algo folder
+SWEEP_ALGO = {"bp_norm_min_sum": "bposd", "bp_lottery": "lottery_bposd"}
 
 STYLES = {  # label: (color, marker, linestyle)
     "baseline": ("black", "o", "-"),
@@ -37,8 +37,9 @@ def load_sw(base, code):
     for path in glob.glob(os.path.join(base, f"BB_{code}_ibm", "p_*", "sw_result.yaml")):
         with open(path, encoding="utf-8") as f:
             res = yaml.safe_load(f)
-        p = float(res["meta"]["p"])
-        algo = res["meta"]["algo"]
+        p = res["meta"].get("p")
+        p = float(p) if p is not None else float(re.search(r"p_([0-9.]+)", path).group(1).rstrip("."))
+        algo = SWEEP_ALGO.get(res["meta"]["algorithm"][0], res["meta"]["algorithm"][0])
         for label, r in res["configs"].items():
             if r["errors"] > 0:
                 data.setdefault(label, {})[p] = r["ler"]

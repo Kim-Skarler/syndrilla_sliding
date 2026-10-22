@@ -1,20 +1,24 @@
-"""Sliding-window BP+OSD decoding directly on the Stim DEM (BB memory-X, IBM circuit).
+"""Sliding-window BP+OSD decoding directly on a Stim DEM.
 
-Windows follow stim_dem_migration_plan.md §2.2:
-- a class belongs to round r_min, the first detector round it touches
+Same inputs as `syndrilla.main`: an interface YAML holding the Stim circuit (`-i`) and a
+decoding YAML (`-d`) whose `algorithm` is `[<bp>, osd_0]`. The circuit's detectors must
+carry their round as the last coordinate (true for tools/bb_circuit_generator.py and for
+stim's generated circuits).
+
+Windows (stim_dem_migration_plan.md §2.2):
+- a class (DEM column) belongs to round r_min, the first detector round it touches
 - window t covers detector rounds [t, min(t+T, D)) and the classes with r_min in [t, t+T);
   classes reaching past the window keep only their rows inside it, with the DEM prior
 - BP runs on the T_BP window; samples BP does not converge go to OSD-0 on the T_OSD window,
-  fed with the BP posterior of those columns (as in syndrilla_STIM_new main_kshot.py)
+  fed with the BP posterior of those columns
 - only classes with r_min == t are committed; they update the residual syndrome of later
-  windows (H) and the predicted observables (L_dem), so no data error vector or Lx is needed
+  windows (H) and the predicted observables (L), so no data error vector is needed
 
-Every config listed in --windows decodes the same Stim samples. "0" is the baseline: one
-window holding the whole DEM. "T" is SW(T) with T_BP = T_OSD = T; "a,b" is SW(T_BP=a, T_OSD=b).
+Every config in `-w` decodes the same Stim samples. "0" is the baseline (one window holding
+the whole DEM), "T" is SW(T) with T_BP = T_OSD = T, and "a,b" is SW(T_BP=a, T_OSD=b).
 
-Usage (repo root):
-  python dem_sw/main_kshot_dem.py -p 0.003 --windows "0;1;2;3;4;3,1;3,2;4,2" -te 100
-  python dem_sw/main_kshot_dem.py -p 0.003 --check      # window bookkeeping test, numpy only
+  python -m syndrilla.main_sliding -r=<dir> -i=interface.yaml -d=decoding.yaml -w="0;1;2;3" -te=100
+  python -m syndrilla.main_sliding -i=interface.yaml --check     # window bookkeeping test, no torch
 """
 import argparse
 import hashlib
@@ -25,10 +29,62 @@ import numpy as np
 import scipy.sparse as sp
 import yaml
 
-from dem_tools import REPO_ROOT, build_dem
 
-ALGOS = {"bposd": "bp_norm_min_sum", "lottery_bposd": "bp_lottery"}
+# ----------------------------------------------------------------------------- DEM
 
+class Dem:
+    """H (detectors x classes), L (observables x classes), priors and round bookkeeping."""
+
+    def __init__(self, circuit):
+        self.circuit = circuit
+        self.dem = circuit.detector_error_model(decompose_errors=False)
+        coords = circuit.get_detector_coordinates()
+        num_det = circuit.num_detectors
+        if any(not coords.get(i) for i in range(num_det)):
+            raise ValueError("every detector needs coordinates whose last entry is its round")
+        self.det_round = np.array([int(coords[i][-1]) for i in range(num_det)])
+        self.rounds = int(self.det_round.max())  # number of detector rounds D = rounds + 1
+
+        h_rows, h_cols, l_rows, l_cols, prior = [], [], [], [], []
+        for inst in self.dem.flattened():
+            if inst.type != "error":
+                continue
+            col = len(prior)
+            prior.append(inst.args_copy()[0])
+            for tgt in inst.targets_copy():
+                if tgt.is_relative_detector_id():
+                    h_rows.append(tgt.val); h_cols.append(col)
+                elif tgt.is_logical_observable_id():
+                    l_rows.append(tgt.val); l_cols.append(col)
+        n_col = len(prior)
+        self.H = sp.csr_matrix((np.ones(len(h_rows), dtype=np.uint8), (h_rows, h_cols)), shape=(num_det, n_col))
+        self.L = sp.csr_matrix((np.ones(len(l_rows), dtype=np.uint8), (l_rows, l_cols)),
+                               shape=(circuit.num_observables, n_col))
+        self.prior = np.array(prior)
+
+        Hc = self.H.tocsc()
+        self.col_rmin = np.full(n_col, -1)
+        for c in range(n_col):
+            dets = Hc.indices[Hc.indptr[c]:Hc.indptr[c + 1]]
+            if dets.size:
+                self.col_rmin[c] = self.det_round[dets].min()
+        undetectable = int(((self.col_rmin < 0) & (np.asarray(self.L.sum(axis=0)).ravel() > 0)).sum())
+        if undetectable:
+            raise ValueError(f"DEM has <{undetectable}> classes that flip an observable but no detector")
+
+
+def load_circuit(interface_yaml):
+    import stim
+
+    with open(interface_yaml, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    circuit = (cfg.get("interface") or {}).get("circuit")
+    if not isinstance(circuit, str):
+        raise ValueError(f"<{interface_yaml}> needs an inline stim circuit under interface.circuit")
+    return stim.Circuit(circuit)
+
+
+# ----------------------------------------------------------------------------- windows
 
 def parse_windows(spec):
     configs = []
@@ -68,6 +124,7 @@ class Window:
         self.pos_commit_in_osd = np.searchsorted(self.cols_osd, self.commit)
         self.H_bp = d.H[self.rows_bp][:, self.cols_bp].tocsr()
         self.H_osd = d.H[self.rows_osd][:, self.cols_osd].tocsr()
+        # windows with the same structure and priors share one decoder
         self.key_bp = _structure_key(self.H_bp, d.prior[self.cols_bp])
         self.key_osd = _structure_key(self.H_osd, d.prior[self.cols_osd])
 
@@ -85,14 +142,11 @@ def build_windows(d, t_bp, t_osd):
     return [Window(d, t, t_bp, t_osd) for t in range(d.rounds + 1)]
 
 
-# ----------------------------------------------------------------------------- check mode
-
 def run_check(d, configs, shots, seed):
     """With the true errors as the decision, every window's residual syndrome must be
-    explained by the window's own columns, and the run must end with zero residual and
-    the true observables."""
-    sampler = d.dem.compile_sampler(seed=seed)
-    dets, obs, errs = sampler.sample(shots, return_errors=True)
+    explained by the window's own columns, each class must be committed once, and the run
+    must end with zero residual and the true observables."""
+    dets, obs, errs = d.dem.compile_sampler(seed=seed).sample(shots, return_errors=True)
     dets, obs, errs = dets.astype(np.uint8), obs.astype(np.uint8), errs.astype(np.uint8)
     H, L = d.H.tocsc(), d.L.tocsc()
     for t_bp, t_osd in configs:
@@ -116,22 +170,45 @@ def run_check(d, configs, shots, seed):
 
 # ----------------------------------------------------------------------------- decoding
 
+def read_decoding(decoding_yaml, force_cpu):
+    """BP and OSD stage configs from a decoding YAML with `algorithm: [<bp>, osd_0]`."""
+    import torch
+
+    with open(decoding_yaml, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)["decoding"]
+    algos = cfg["algorithm"] if isinstance(cfg["algorithm"], list) else [cfg["algorithm"]]
+    if len(algos) != 2 or algos[1] != "osd_0":
+        raise ValueError(f"main_sliding needs algorithm: [<bp>, osd_0], got <{algos}>")
+    stage_cfg = cfg.get("config") or {}
+    stage_cfg = stage_cfg if isinstance(stage_cfg, list) else [stage_cfg, {}]
+
+    want_cuda = (cfg.get("device") or {}).get("device_type", "cuda") == "cuda"
+    device = torch.device("cuda:0" if want_cuda and torch.cuda.is_available() and not force_cpu else "cpu")
+    dtype = getattr(torch, str(cfg.get("dtype", "float64")))
+    shared = {k: v for k, v in cfg.items() if k not in ("algorithm", "config", "device")}
+    shared["device"] = {"device_type": device.type, "device_idx": device.index or 0}
+
+    stages = []
+    for algo, sc in zip(algos, stage_cfg):
+        stage = {**shared, "algorithm": algo}
+        if sc:
+            stage["config"] = sc
+        stages.append(stage)
+    return stages, device, dtype, algos
+
+
 class WindowDecoders:
     """BP and OSD-0 decoders per distinct window structure, built with syndrilla."""
 
-    def __init__(self, d, algo, max_iter, device, dtype):
-        import torch
+    def __init__(self, stages, device):
         from syndrilla.decoder.decoder import create_decoder
         from syndrilla.matrix.matrix import MatrixBundle, dense_to_index_format
 
-        self.torch = torch
+        self.stages = {"bp": stages[0], "osd": stages[1]}
+        self.device = device
         self._create_decoder = create_decoder
         self._bundle_cls = MatrixBundle
         self._to_index = dense_to_index_format
-        self.bp_algo = ALGOS[algo]
-        self.max_iter = max_iter
-        self.device = device
-        self.dtype = dtype
         self.cache = {}
 
     def _bundle(self, H):
@@ -149,26 +226,19 @@ class WindowDecoders:
         m = _WindowMatrix()
         return self._bundle_cls(m, m, None, None)
 
-    def _cfg(self, algorithm, with_iter):
-        cfg = {"algorithm": algorithm, "check_type": "hx", "dtype": str(self.dtype).replace("torch.", ""),
-               "device": {"device_type": self.device.type, "device_idx": self.device.index or 0}}
-        if with_iter:
-            cfg["config"] = {"max_iter": int(self.max_iter)}
-        return cfg
-
     def get(self, key, H, kind):
         if (key, kind) not in self.cache:
             bundle = self._bundle(H)
-            cfg = self._cfg(self.bp_algo, True) if kind == "bp" else self._cfg("osd_0", False)
-            dec = self._create_decoder(cfg=cfg, bundle=bundle)[0]
+            dec = self._create_decoder(cfg=dict(self.stages[kind]), bundle=bundle)[0]
             dec.to(self.device).eval()
             self.cache[(key, kind)] = (dec, bundle.select("hx")[3])
         return self.cache[(key, kind)]
 
 
 def decode_config(wd, d, windows, dets, llr_all, H_t, L_t):
-    """Decode one batch with one window config. Returns per-sample failure and stats."""
-    torch = wd.torch
+    """Decode one batch with one window config."""
+    import torch
+
     B = dets.shape[0]
     resid = dets.clone()
     obs_pred = torch.zeros((B, d.L.shape[0]), dtype=torch.float32, device=wd.device)
@@ -200,29 +270,28 @@ def decode_config(wd, d, windows, dets, llr_all, H_t, L_t):
 def run_decode(args, d, configs):
     import torch
 
-    device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda:0")
-    dtype = torch.float64
-    wd = WindowDecoders(d, args.algo, args.max_iter, device, dtype)
+    stages, device, dtype, algos = read_decoding(args.decoding_yaml, args.cpu)
+    wd = WindowDecoders(stages, device)
     windows = {c: build_windows(d, *c) for c in configs}
-    H_t = torch.as_tensor(d.H.T.toarray(), dtype=torch.float32, device=device)  # cols x dets
+    H_t = torch.as_tensor(d.H.T.toarray(), dtype=torch.float32, device=device)  # classes x detectors
     L_t = torch.as_tensor(d.L.T.toarray(), dtype=torch.float32, device=device)
     llr_all = torch.as_tensor(np.log((1 - d.prior) / d.prior), dtype=dtype, device=device)
 
-    out_dir = args.run_dir or os.path.join(REPO_ROOT, "results_sw", f"BB_{d.code}_ibm", f"p_{args.p}")
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, "sw_result.yaml")
-    meta = {"code": d.code, "p": args.p, "rounds": d.rounds, "algo": args.algo, "max_iter": args.max_iter,
+    os.makedirs(args.run_dir, exist_ok=True)
+    out_path = os.path.join(args.run_dir, "sw_result.yaml")
+    meta = {"interface": os.path.abspath(args.interface_yaml), "algorithm": algos,
+            "bp_config": stages[0].get("config", {}), "p": args.p, "rounds": d.rounds,
             "seed": args.seed, "dem_shape": list(d.H.shape)}
-    stats = {c: {"shots": 0, "errors": 0, "bp_conv": 0.0, "bp_iter": 0.0, "resid_nonzero": 0, "time_s": 0.0}
-             for c in configs}
+    keys = ("shots", "errors", "bp_conv", "bp_iter", "resid_nonzero", "time_s")
+    stats = {c: dict.fromkeys(keys, 0) for c in configs}
     if os.path.exists(out_path) and not args.fresh:
         with open(out_path, encoding="utf-8") as f:
-            prev = yaml.safe_load(f)
-        if prev and prev.get("meta") == meta:
+            prev = yaml.safe_load(f) or {}
+        if prev.get("meta") == meta:
             for c in configs:
                 r = prev["configs"].get(config_label(*c))
                 if r:
-                    stats[c] = {k: r[k] for k in stats[c]}
+                    stats[c] = {k: r[k] for k in keys}
             print(f"[resume] {out_path}")
 
     def shots_done():
@@ -231,6 +300,7 @@ def run_decode(args, d, configs):
     batch = 0
     while (min(s["errors"] for s in stats.values()) < args.target_error
            and (args.max_shots <= 0 or shots_done() < args.max_shots)):
+        # seeding by the shot count keeps a resumed run on fresh samples
         sampler = d.dem.compile_sampler(seed=args.seed + shots_done())
         dets_np, obs_np, _ = sampler.sample(args.batch_size)
         dets = torch.as_tensor(dets_np.astype(np.uint8), device=device)
@@ -277,35 +347,36 @@ def save(path, meta, stats, windows, d):
     os.replace(tmp, path)
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--code", default="144")
-    ap.add_argument("-p", type=float, required=True)
-    ap.add_argument("--rounds", type=int, default=None, help="default: code distance")
-    ap.add_argument("--windows", default="0;1;2;3;4;3,1;3,2;4,2")
-    ap.add_argument("--algo", default="bposd", choices=sorted(ALGOS))
-    ap.add_argument("--max-iter", type=int, default=None, help="default: code length n")
-    ap.add_argument("-bs", "--batch-size", type=int, default=5000)
-    ap.add_argument("-te", "--target-error", type=int, default=100,
+def parse_commandline_args():
+    ap = argparse.ArgumentParser(description="Sliding-window BP+OSD on a Stim DEM")
+    ap.add_argument("-r", "--run_dir", default="tests/test_outputs", help="output directory")
+    ap.add_argument("-i", "--interface_yaml", required=True, help="interface YAML with the stim circuit")
+    ap.add_argument("-d", "--decoding_yaml", default=None, help="decoding YAML, algorithm [<bp>, osd_0]")
+    ap.add_argument("-w", "--windows", default="0;1;2;3;4;3,1;3,2;4,2",
+                    help="'0' baseline, 'T' SW(T), 'a,b' SW(T_BP=a, T_OSD=b), separated by ';'")
+    ap.add_argument("-bs", "--batch_size", type=int, default=5000)
+    ap.add_argument("-te", "--target_error", type=int, default=100,
                     help="stop once every config has at least this many logical errors")
-    ap.add_argument("--max-shots", type=int, default=0, help="0 = no limit")
+    ap.add_argument("-ms", "--max_shots", type=int, default=0, help="0 = no limit")
+    ap.add_argument("-p", "--p", type=float, default=None, help="physical error rate, recorded in the result")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("-r", "--run-dir", default=None, help="default: results_sw/BB_<n>_ibm/p_<p>")
     ap.add_argument("--fresh", action="store_true", help="ignore an existing result file")
     ap.add_argument("--cpu", action="store_true")
     ap.add_argument("--check", action="store_true", help="window bookkeeping test with the true errors")
-    ap.add_argument("--check-shots", type=int, default=200)
-    args = ap.parse_args()
+    ap.add_argument("--check_shots", type=int, default=200)
+    return ap.parse_args()
 
-    d = build_dem(args.code, args.p, args.rounds)
-    if args.max_iter is None:
-        args.max_iter = d.H.shape[0] // (d.rounds + 1) * 2  # n = 2 * checks for BB codes
+
+def main():
+    args = parse_commandline_args()
+    d = Dem(load_circuit(args.interface_yaml))
     configs = parse_windows(args.windows)
-    print(f"code={d.code} p={args.p} rounds={d.rounds} DEM={d.H.shape} configs="
-          f"{[config_label(*c) for c in configs]}")
+    print(f"DEM={d.H.shape} rounds={d.rounds} configs={[config_label(*c) for c in configs]}")
     if args.check:
         run_check(d, configs, args.check_shots, args.seed)
     else:
+        if not args.decoding_yaml:
+            raise ValueError("decoding needs -d <decoding yaml>")
         run_decode(args, d, configs)
 
 
