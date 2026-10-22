@@ -68,7 +68,7 @@ DEFAULT_CONFIG = {
     "TARGET_ERROR": {
         0.01: 200,
         0.005: 100,
-        0.003: 20,
+        0.003: 10,
         0.001: 5,
         "default": 100
     },
@@ -193,6 +193,45 @@ def get_existing_result_file(point_dir: str) -> str:
             return os.path.join(point_dir, fname)
     return None
 
+def get_checkpoint_field(res_file: str, field: str):
+    """結果檔 decoder_full 區塊的整數欄位 (例如 "batch size"、"target error")，讀不到回傳 None"""
+    in_full = False
+    try:
+        with open(res_file, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.startswith("decoder_full:"):
+                    in_full = True
+                elif in_full:
+                    if not line.startswith(" "):
+                        break
+                    key, _, val = line.strip().partition(":")
+                    if key == field:
+                        return int(val.strip())
+    except (OSError, ValueError):
+        pass
+    return None
+
+def set_checkpoint_target_error(res_file: str, target_error: int):
+    """改寫 decoder_full 的 "target error"。它只是停止條件，不影響任何統計；
+    syndrilla 接續時要求它和 -te 相同，改寫後才能把已完成的點繼續累積到新的目標"""
+    with open(res_file, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    in_full = False
+    for i, line in enumerate(lines):
+        if line.startswith("decoder_full:"):
+            in_full = True
+        elif in_full:
+            if not line.startswith(" "):
+                break
+            if line.strip().startswith("target error:"):
+                indent = line[:len(line) - len(line.lstrip())]
+                lines[i] = f"{indent}target error: {target_error}\n"
+                break
+    tmp = res_file + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    os.replace(tmp, res_file)
+
 def is_point_finished(point_dir: str, target_error: int) -> bool:
     """
     Check if a result_phy_err_*.yaml already exists and has reached target error.
@@ -271,8 +310,24 @@ def worker_task(task_info: tuple, gpu_queue: Queue, dry_run: bool = False):
 
         start_time = time.time()
         current_bs = batch_size
+        oom_shrunk = False
 
         while True:
+            # syndrilla 接續時要求 batch size 與 checkpoint 相同:
+            # - 一般重啟: 改用 checkpoint 的 batch size 接續
+            # - OOM 減半後: 無法用較小的 batch 接續，把舊結果備份成 .bak 後從頭跑這個點
+            existing_ckpt = get_existing_result_file(point_dir)
+            ckpt_bs = get_checkpoint_field(existing_ckpt, "batch size") if existing_ckpt else None
+            if ckpt_bs and ckpt_bs != current_bs:
+                if not oom_shrunk:
+                    print(f"\033[96m[RESUME]\033[0m {code_tag} d={distance} {algo} p={error_rate}: 沿用 checkpoint 的 bs={ckpt_bs} (設定為 {current_bs})")
+                    current_bs = ckpt_bs
+                else:
+                    backup = f"{existing_ckpt}.bs{ckpt_bs}.bak"
+                    os.replace(existing_ckpt, backup)
+                    print(f"\033[93m[RESTART]\033[0m {code_tag} d={distance} {algo} p={error_rate}: bs={current_bs} 無法接續 bs={ckpt_bs} 的 checkpoint，舊結果備份為 {os.path.basename(backup)}，從頭跑")
+                    existing_ckpt = None
+
             cmd = [
                 sys.executable, "-m", "syndrilla.main",
                 f"-r={point_dir}",
@@ -283,8 +338,11 @@ def worker_task(task_info: tuple, gpu_queue: Queue, dry_run: bool = False):
             ]
 
             # 斷點接續: 如果已有未達標的結果檔案，傳入 -ckpt 進行接續累積 (修復原先誤用 -c 的 Bug)
-            existing_ckpt = get_existing_result_file(point_dir)
             if existing_ckpt:
+                ckpt_te = get_checkpoint_field(existing_ckpt, "target error")
+                if ckpt_te is not None and ckpt_te != target_error:
+                    print(f"\033[96m[RESUME]\033[0m {code_tag} d={distance} {algo} p={error_rate}: target error {ckpt_te} -> {target_error}，接續累積")
+                    set_checkpoint_target_error(existing_ckpt, target_error)
                 cmd.append(f"-ckpt={existing_ckpt}")
 
             print(f"\033[92m[START]\033[0m [{gpu_str}] {code_tag} d={distance} {algo} p={error_rate} (bs={current_bs}) -> {point_dir}")
@@ -316,6 +374,7 @@ def worker_task(task_info: tuple, gpu_queue: Queue, dry_run: bool = False):
                     next_bs = max(1, current_bs // 2)
                     print(f"\033[93m[OOM 💥]\033[0m [{gpu_str}] {code_tag} d={distance} {algo} p={error_rate} bs={current_bs} 記憶體不足，自動減半至 bs={next_bs} 重跑...")
                     current_bs = next_bs
+                    oom_shrunk = True
                 else:
                     print(f"\033[91m[FAILED]\033[0m [{gpu_str}] {code_tag} d={distance} {algo} p={error_rate} 非記憶體錯誤 (code={res.returncode}, see {log_file})")
                     break
