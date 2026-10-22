@@ -55,8 +55,11 @@ DEFAULT_CONFIG = {
     # 雜訊模型: "CIRCUIT_LEVEL" 或 "PHENOMENOLOGICAL"
     "NOISE_MODEL": "CIRCUIT_LEVEL",
 
-    # BB 電路排程: "ibm" (與 IBM decoder_setup.py 相同的 depth-8 cycle 與雜訊模型) 或 "7layer" (舊版電路)
-    # "ibm" 的結果存到 BB_<n>_ibm/，"7layer" 沿用 BB_<n>/
+    # BB 電路排程:
+    # - "ibm":    與 IBM decoder_setup.py 相同的 depth-8 cycle 與雜訊模型，只宣告 X detectors
+    # - "7layer": 參考 Stim generated circuit 的結構與雜訊 (X+Z detectors)，原本的 CNOT 順序
+    # - "stim":   同 7layer，但換成 IBM 的 CNOT 順序 (circuit distance 較高)
+    # 結果存到 BB_<n>_<schedule>/
     "BB_SCHEDULE": "ibm",
 
     # 預設執行參數
@@ -85,7 +88,7 @@ def parse_args():
     parser.add_argument("-bs", "--batch-size", type=int, default=DEFAULT_CONFIG["BATCH_SIZE"], help="Batch size per step")
     parser.add_argument("-te", "--target-error", type=str, default=None, help="Target logical error count (e.g. '100' or '0.01:500,0.005:200,default:50')")
     parser.add_argument("--max-iter", type=str, default=str(DEFAULT_CONFIG["MAX_ITER"]), help="Max BP iterations (default: 'auto' to use code length n, or specify an integer)")
-    parser.add_argument("--bb-schedule", type=str, default=DEFAULT_CONFIG["BB_SCHEDULE"], choices=["ibm", "7layer"], help="BB circuit schedule and noise model (default: ibm)")
+    parser.add_argument("--bb-schedule", type=str, default=DEFAULT_CONFIG["BB_SCHEDULE"], choices=["ibm", "7layer", "stim"], help="BB circuit schedule and noise model (default: ibm)")
     parser.add_argument("--cpu", action="store_true", help="Force CPU execution")
     parser.add_argument("--dry-run", action="store_true", help="Print experiment points without running")
     parser.add_argument("-r", "--result-dir", type=str, default=DEFAULT_CONFIG["BASE_RESULT_DIR"], help="Output results directory")
@@ -211,7 +214,7 @@ def worker_task(task_info: tuple, gpu_queue: Queue, dry_run: bool = False):
     code, distance, error_rate, algo, batch_size, target_error, max_iter, base_dir, use_cpu, bb_schedule = task_info
 
     code_tag = f"BB_{code}" if str(code).isdigit() else str(code).replace("[", "").replace("]", "").replace(",", "_")
-    if code.lower() != "surface" and bb_schedule != "7layer":
+    if code.lower() != "surface":
         code_tag += f"_{bb_schedule}"
     point_dir = os.path.join(base_dir, code_tag, f"d_{distance}", algo, f"p_{error_rate}")
     

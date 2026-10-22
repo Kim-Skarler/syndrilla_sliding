@@ -43,6 +43,9 @@ BB_COLORS = {
 }
 
 # 2. 解碼器樣式 (Decoder 不同 Marker / 線型)
+# BB 結果資料夾的電路後綴 BB_<n>_<schedule>
+BB_SCHEDULES = ("ibm", "stim", "7layer")
+
 DECODER_STYLES_BPOSD = {
     "bposd": {"marker": "o", "ls": "-", "label": "BP + OSD-0"},
     "lottery_bposd": {"marker": "s", "ls": "--", "label": "Lottery BP + OSD-0 (PRE)"},
@@ -109,7 +112,7 @@ def collect_data(results_dir: str):
     """
     掃描 results 目錄 (只收集 STIM DEM 結果)
     單次遍歷同時擷取 BPOSD 與純 BP 數據。
-    BB 依電路版本分組: 資料夾 BB_<n>_ibm -> "ibm"，BB_<n> -> "7layer"
+    BB 依電路版本分組: 資料夾 BB_<n>_<schedule> (ibm / stim / 7layer)，沒有後綴的 BB_<n> 視為 "7layer"
     回傳: (surface_osd, bb_osd), (surface_bp, bb_bp)，其中 bb_* 為 {schedule: {code: {algo: {p: ler}}}}
     """
     surface_osd = {}
@@ -173,9 +176,11 @@ def collect_data(results_dir: str):
                         surface_bp.setdefault(dist, {}).setdefault(algo, {})[p_err] = ler_bp
                 else:
                     schedule = "7layer"
-                    if code_tag.endswith("_ibm"):
-                        schedule = "ibm"
-                        code_tag = code_tag[:-len("_ibm")]
+                    for s in BB_SCHEDULES:
+                        if code_tag.endswith(f"_{s}"):
+                            schedule = s
+                            code_tag = code_tag[:-len(s) - 1]
+                            break
                     m_bb = re.search(r'(\[\[.+\]\])', code_tag)
                     clean_code = m_bb.group(1) if m_bb else code_tag
                     if ler_osd is not None:
@@ -285,8 +290,9 @@ def main():
     # 單次掃描，同時收集 OSD 與純 BP
     (surface_osd, bb_osd), (surface_bp, bb_bp) = collect_data(args.results_dir)
 
-    # BB 依電路版本分開畫: 7layer -> bb_code_*.png (原檔名)，ibm -> bb_code_ibm_*.png
-    bb_variants = {"7layer": ("", ""), "ibm": ("_ibm", " [IBM circuit]")}
+    # BB 依電路版本分開畫: 7layer -> bb_code_*.png (原檔名)，其他 -> bb_code_<schedule>_*.png
+    bb_variants = {"7layer": ("", " [Stim-style, 7-layer order]"), "stim": ("_stim", " [Stim-style, IBM order]"),
+                   "ibm": ("_ibm", " [IBM circuit]")}
 
     # 1. 繪製 BPOSD vs LotteryOSD
     if surface_osd:

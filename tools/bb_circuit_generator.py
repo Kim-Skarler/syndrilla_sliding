@@ -246,9 +246,14 @@ def _build_ibm_bb_circuit(
     rounds: int,
     p: float,
     sX: list = None,
-    sZ: list = None
+    sZ: list = None,
+    z_detectors: bool = False
 ) -> stim.Circuit:
     """
+    z_detectors=True also declares Z-check detectors (round > 0, coordinates
+    [num_checks + j, r]), so the DEM keeps the X/Z correlation of Y errors; the default
+    is X detectors only, matching IBM's separate X/Z decoding.
+
     Memory-X circuit with the cycle and noise model of decoder_setup.py:
     - t0: PrepX X checks, Z CNOTs; t1-t5: X and Z CNOTs; t6: MeasZ Z checks, X CNOTs;
       t7: MeasX X checks, PrepZ Z checks, all data idle
@@ -319,6 +324,10 @@ def _build_ibm_bb_circuit(
             else:
                 rec_prev = stim.target_rec(-3 * num_checks + i)
                 circuit.append("DETECTOR", [rec_now, rec_prev], [i, r])
+        if z_detectors and r > 0:  # first-round Z outcomes are random for |+> data
+            for j in range(num_checks):
+                circuit.append("DETECTOR", [stim.target_rec(-2 * num_checks + j),
+                                            stim.target_rec(-4 * num_checks + j)], [num_checks + j, r])
         circuit.append("TICK")
 
     circuit.append("MX", data_qubits)
@@ -490,7 +499,8 @@ def generate_bb_interface_yaml(
     noise_model: str = "CIRCUIT_LEVEL",
     schedule: str = "ibm",
     search_base: str = "examples/txt/BB",
-    decompose_errors: bool = False
+    decompose_errors: bool = False,
+    z_detectors: bool = False
 ) -> str:
     """
     Main generator interface function: builds Stim circuit and saves to .interface.yaml
@@ -504,17 +514,21 @@ def generate_bb_interface_yaml(
             Hx_matrix=Hx, logical_x_matrix=Lx, rounds=rounds,
             p_data=error_rate, p_meas=error_rate
         )
-    elif schedule in ("ibm", "7layer") and bb_key in BB_CODE_DICT:
+    elif schedule in ("ibm", "7layer", "stim") and bb_key in BB_CODE_DICT:
         ell, m_val, a1, a2, a3, b1, b2, b3 = BB_CODE_DICT[bb_key]
         matchings = get_bb_matchings(ell, m_val, a1, a2, a3, b1, b2, b3)
         num_data = 2 * ell * m_val
         num_checks = ell * m_val
         if schedule == "ibm":
-            circuit = _build_ibm_bb_circuit(matchings, num_data, num_checks, Lx, rounds, error_rate)
+            circuit = _build_ibm_bb_circuit(matchings, num_data, num_checks, Lx, rounds, error_rate,
+                                            z_detectors=z_detectors)
         else:
+            # "7layer": Stim generated-circuit conventions with the original CNOT order;
+            # "stim": the same circuit and noise with IBM's CNOT order (higher circuit distance)
+            sX, sZ = (IBM_SX, IBM_SZ) if schedule == "stim" else (None, None)
             circuit = _build_7layer_bb_circuit(
                 matchings, (0, 1, 2), (3, 4, 5), num_data, num_checks, num_checks,
-                Lx, rounds, error_rate, error_rate, error_rate, error_rate
+                Lx, rounds, error_rate, error_rate, error_rate, error_rate, sX=sX, sZ=sZ
             )
     else:
         circuit = generate_bb_code_circuit_level(
@@ -585,8 +599,9 @@ if __name__ == "__main__":
     parser.add_argument("-r", "--rounds", type=int, default=0, help="Number of syndrome measurement rounds")
     parser.add_argument("-o", "--output", type=str, default="generated.interface.yaml", help="Output YAML path")
     parser.add_argument("--noise", type=str, default="CIRCUIT_LEVEL", choices=["CIRCUIT_LEVEL", "PHENOMENOLOGICAL"])
-    parser.add_argument("--schedule", type=str, default="ibm", choices=["ibm", "7layer", "greedy"],
-                        help="BB circuit: 'ibm' = IBM depth-8 cycle and noise, '7layer' = previous 7-layer circuit, 'greedy' = greedy CNOT layering")
+    parser.add_argument("--schedule", type=str, default="ibm", choices=["ibm", "7layer", "stim", "greedy"],
+                        help="BB circuit: 'ibm' = IBM depth-8 cycle and noise, '7layer' = Stim-convention 7-layer circuit, "
+                             "'stim' = 7layer with IBM's CNOT order, 'greedy' = greedy CNOT layering")
     args = parser.parse_args()
 
     r = args.rounds if args.rounds > 0 else (args.distance if args.distance > 0 else None)
