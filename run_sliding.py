@@ -25,6 +25,10 @@ DEFAULT_CONFIG = {
     "ERROR_RATES": [0.001, 0.002, 0.003, 0.005],
     # "0" baseline (whole DEM), "T" SW(T), "a,b" SW(T_BP=a, T_OSD=b)
     "WINDOWS": "0;1;2;3;4;3,1;3,2;4,2",
+    # merge columns made identical by window truncation: "off", "on", or "off,on" (both, same samples)
+    "MERGE_WINDOW": "off",
+    # window column order (OSD tie-breaks): any of "dem", "prior", "random", comma separated
+    "COL_ORDER": "dem",
     # "bposd": bp_norm_min_sum + osd_0, "lottery_bposd": bp_lottery + osd_0
     "ALGO": "bposd",
     "BATCH_SIZE": 5000,
@@ -45,14 +49,18 @@ def resolve_target_error(spec, rate):
     return int(spec)
 
 
-def build_decoding_config(algo, max_iter, use_cpu):
-    return {"decoding": {
+def build_decoding_config(algo, max_iter, use_cpu, force_pytorch=False):
+    dec = {
         "algorithm": [BP_ALGO[algo], "osd_0"],
         "check_type": "hx",
         "dtype": "float64",
         "device": {"device_type": "cpu" if use_cpu else "cuda", "device_idx": 0},
         "config": {"max_iter": int(max_iter)},
-    }}
+    }
+    if force_pytorch:
+        # torch modules on the GPU instead of the JIT-compiled CUDA kernels (no nvcc/MSVC needed)
+        dec["force_pytorch"] = True
+    return {"decoding": dec}
 
 
 def is_finished(point_dir, target_error, max_shots, num_configs):
@@ -75,7 +83,8 @@ def worker_task(task, gpu_queue, args):
     code, rate, target_error = task
     _, bb_key, distance = resolve_bb_prefix(code)
     point_dir = os.path.join(args.result_dir, f"BB_{code}_ibm", f"p_{rate}")
-    num_configs = len([w for w in args.windows.split(";") if w.strip()])
+    num_configs = (len([w for w in args.windows.split(";") if w.strip()])
+                   * len(args.merge_window.split(",")) * len(args.col_order.split(",")))
     if is_finished(point_dir, target_error, args.max_shots, num_configs):
         print(f"\033[93m[SKIP]\033[0m BB_{code} p={rate} already finished in {point_dir}.")
         return
@@ -88,11 +97,11 @@ def worker_task(task, gpu_queue, args):
     # max_iter = n, the BP-family study convention
     max_iter = args.max_iter or int(bb_key)
     with open(decoding_yaml, "w", encoding="utf-8") as f:
-        yaml.safe_dump(build_decoding_config(args.algo, max_iter, args.cpu), f, sort_keys=False)
+        yaml.safe_dump(build_decoding_config(args.algo, max_iter, args.cpu, args.force_pytorch), f, sort_keys=False)
 
     cmd = [sys.executable, "-m", "syndrilla.main_sliding", f"-r={point_dir}", f"-i={interface_yaml}",
            f"-d={decoding_yaml}", f"-w={args.windows}", f"-bs={args.batch_size}", f"-te={target_error}",
-           f"-ms={args.max_shots}", f"-p={rate}"]
+           f"-ms={args.max_shots}", f"-p={rate}", f"-mw={args.merge_window}", f"-co={args.col_order}"]
     if args.cpu:
         cmd.append("--cpu")
     if args.dry_run:
@@ -122,6 +131,9 @@ def parse_args():
     ap.add_argument("--codes", default=None, help="comma separated BB codes, e.g. '144,72'")
     ap.add_argument("--rates", default=None, help="comma separated physical error rates")
     ap.add_argument("--windows", default=DEFAULT_CONFIG["WINDOWS"])
+    ap.add_argument("--merge-window", default=DEFAULT_CONFIG["MERGE_WINDOW"], help="off, on, or off,on")
+    ap.add_argument("--col-order", default=DEFAULT_CONFIG["COL_ORDER"], help="comma separated: dem, prior, random")
+    ap.add_argument("--force-pytorch", action="store_true", help="torch modules instead of the CUDA kernels")
     ap.add_argument("--algo", default=DEFAULT_CONFIG["ALGO"], choices=sorted(BP_ALGO))
     ap.add_argument("--max-iter", type=int, default=None, help="default: code length n")
     ap.add_argument("-bs", "--batch-size", type=int, default=DEFAULT_CONFIG["BATCH_SIZE"])
@@ -148,7 +160,7 @@ def main():
     print(f"  Total points: {len(tasks)}")
     print(f"  Codes:        {codes}")
     print(f"  Error Rates:  {rates}")
-    print(f"  Windows:      {args.windows}")
+    print(f"  Windows:      {args.windows}  (merge: {args.merge_window}, col order: {args.col_order})")
     print(f"  Algorithm:    {args.algo}")
     print(f"  GPUs:         {gpus} (workers/gpu: {args.workers_per_gpu})")
     print("=" * 70)

@@ -19,6 +19,8 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 # BP stage of the sliding-window decoder -> run_sweep_v3 algo folder
 SWEEP_ALGO = {"bp_norm_min_sum": "bposd", "bp_lottery": "lottery_bposd"}
 
+VARIANT_LS = {"merge": (0, (6, 2)), "prior": (0, (1, 1)), "random": (0, (3, 1, 1, 1)),
+              "merge+prior": (0, (6, 1, 1, 1)), "merge+random": (0, (6, 1, 1, 1, 1, 1))}
 STYLES = {  # label: (color, marker, linestyle)
     "baseline": ("black", "o", "-"),
     "SW(1)": ("#d62728", "v", "--"),
@@ -73,9 +75,19 @@ def main():
     sweep = load_sweep_baseline(args.sweep_dir, args.code, algo)
 
     fig, ax = plt.subplots(figsize=(8, 6), dpi=300)
-    for label in sorted(data, key=lambda s: (s != "baseline", list(STYLES).index(s) if s in STYLES else 99, s)):
+    def style(label):
+        # "SW(2)+merge+prior": color/marker from the window, line style from the variant
+        base, _, variant = label.partition("+")
+        color, marker, ls = STYLES.get(base, ("gray", "x", "-."))
+        return color, marker, VARIANT_LS.get(variant, ls)
+
+    def order(label):
+        base = label.partition("+")[0]
+        return (base != "baseline", list(STYLES).index(base) if base in STYLES else 99, label)
+
+    for label in sorted(data, key=order):
         pts = data[label]
-        color, marker, ls = STYLES.get(label, ("gray", "x", "-."))
+        color, marker, ls = style(label)
         ps = sorted(pts)
         ax.plot(ps, [pts[p] for p in ps], color=color, marker=marker, ls=ls, lw=1.5, markersize=6,
                 markerfacecolor="none", label=label)
