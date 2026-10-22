@@ -117,7 +117,8 @@ def parse_windows(spec):
 
 
 def parse_configs(windows_spec, merge_spec, order_spec):
-    """Every (T_BP, T_OSD, merge, column order) combination."""
+    """Every (T_BP, T_OSD, merge, column order) combination. The baseline runs unmerged
+    only: Stim already merged identical DEM columns, so a whole-DEM merge changes nothing."""
     merges = []
     for m in merge_spec.split(","):
         m = m.strip()
@@ -128,7 +129,12 @@ def parse_configs(windows_spec, merge_spec, order_spec):
     for o in orders:
         if o not in COL_ORDERS:
             raise ValueError(f"col_order entries are {COL_ORDERS}, got <{o}>")
-    return [(t_bp, t_osd, m, o) for (t_bp, t_osd), m, o in itertools.product(parse_windows(windows_spec), merges, orders)]
+    configs = []
+    for (t_bp, t_osd), m, o in itertools.product(parse_windows(windows_spec), merges, orders):
+        cfg = (t_bp, t_osd, m and t_bp != 0, o)
+        if cfg not in configs:
+            configs.append(cfg)
+    return configs
 
 
 def config_label(t_bp, t_osd, merge=False, order="dem"):

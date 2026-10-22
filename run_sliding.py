@@ -19,24 +19,30 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tools.bb_circuit_generator import generate_bb_interface_yaml, resolve_bb_prefix  # noqa: E402
+from syndrilla.main_sliding import config_label, parse_configs  # noqa: E402
 
 DEFAULT_CONFIG = {
     "CODES": ["144"],
-    "ERROR_RATES": [0.001, 0.002, 0.003, 0.005],
-    # "0" baseline (whole DEM), "T" SW(T), "a,b" SW(T_BP=a, T_OSD=b)
+    "ERROR_RATES": [0.001, 0.003, 0.005, 0.01],
     # BB 電路: "7layer_x" (7layer 的 Stim 風格電路與雜訊，只宣告 X detectors，binary 解 Z 錯誤)
     # 或 "ibm" (IBM decoder_setup.py 的電路與雜訊，只宣告 X detectors)
     "BB_SCHEDULE": "7layer_x",
-    "WINDOWS": "0;1;2;3;4;3,1;3,2;4,2",
-    # merge columns made identical by window truncation: "off", "on", or "off,on" (both, same samples)
-    "MERGE_WINDOW": "off",
-    # window column order (OSD tie-breaks): any of "dem", "prior", "random", comma separated
-    "COL_ORDER": "dem",
+
+    # ---- 要跑哪些解碼設定 (全部用同一批 sample) ----
+    # 完整 DEM 一次解碼 (baseline)
+    "RUN_BASELINE": True,
+    # sliding window 大小: T 代表 SW(T) (BP、OSD 視窗相同)，(T_BP, T_OSD) 代表 BP 視窗大於 OSD 視窗
+    "SW_WINDOWS": [1, 2, 3, 4, (3, 1), (3, 2), (4, 2)],
+    # sliding window 是否做視窗內合併: [False] 只跑原始，[True] 只跑合併，[False, True] 兩種都跑
+    "MERGE": [False, True],
+    # 視窗內 column 順序 (OSD 的 tie-break): "dem" = Stim 原本順序 (不排序)；"prior"、"random" 之後再測
+    "COL_ORDER": ["dem"],
+
     # "bposd": bp_norm_min_sum + osd_0, "lottery_bposd": bp_lottery + osd_0
     "ALGO": "bposd",
     "BATCH_SIZE": 5000,
     # logical errors per config; low p is expensive, so it gets fewer
-    "TARGET_ERROR": {0.001: 5, 0.003: 50, 0.005: 100, 0.005: 200, 0.01: 500, "default": 100},
+    "TARGET_ERROR": {0.001: 5, 0.003: 50, 0.005: 200, 0.01: 500, "default": 100},
     "BASE_RESULT_DIR": "results_sw",
 }
 
@@ -86,8 +92,7 @@ def worker_task(task, gpu_queue, args):
     code, rate, target_error = task
     _, bb_key, distance = resolve_bb_prefix(code)
     point_dir = os.path.join(args.result_dir, f"BB_{code}_{args.bb_schedule}", f"p_{rate}")
-    num_configs = (len([w for w in args.windows.split(";") if w.strip()])
-                   * len(args.merge_window.split(",")) * len(args.col_order.split(",")))
+    num_configs = len(parse_configs(args.windows, args.merge_window, args.col_order))
     if is_finished(point_dir, target_error, args.max_shots, num_configs):
         print(f"\033[93m[SKIP]\033[0m BB_{code} p={rate} already finished in {point_dir}.")
         return
@@ -135,9 +140,10 @@ def parse_args():
     ap.add_argument("--rates", default=None, help="comma separated physical error rates")
     ap.add_argument("--bb-schedule", default=DEFAULT_CONFIG["BB_SCHEDULE"], choices=["7layer_x", "ibm"],
                     help="BB circuit, X detectors only (default: 7layer_x)")
-    ap.add_argument("--windows", default=DEFAULT_CONFIG["WINDOWS"])
-    ap.add_argument("--merge-window", default=DEFAULT_CONFIG["MERGE_WINDOW"], help="off, on, or off,on")
-    ap.add_argument("--col-order", default=DEFAULT_CONFIG["COL_ORDER"], help="comma separated: dem, prior, random")
+    # leave these unset to use RUN_BASELINE / SW_WINDOWS / MERGE / COL_ORDER above
+    ap.add_argument("--windows", default=None, help="override, e.g. '0;1;2;3,1' (0 = baseline)")
+    ap.add_argument("--merge-window", default=None, help="override: off, on, or off,on")
+    ap.add_argument("--col-order", default=None, help="override, comma separated: dem, prior, random")
     ap.add_argument("--force-pytorch", action="store_true", help="torch modules instead of the CUDA kernels")
     ap.add_argument("--algo", default=DEFAULT_CONFIG["ALGO"], choices=sorted(BP_ALGO))
     ap.add_argument("--max-iter", type=int, default=None, help="default: code length n")
@@ -152,8 +158,25 @@ def parse_args():
     return ap.parse_args()
 
 
+def windows_from_config(cfg):
+    """RUN_BASELINE + SW_WINDOWS -> main_sliding's '-w' string, e.g. '0;1;2;3,1'."""
+    items = ["0"] if cfg["RUN_BASELINE"] else []
+    for w in cfg["SW_WINDOWS"]:
+        items.append(f"{w[0]},{w[1]}" if isinstance(w, (tuple, list)) else str(w))
+    if not items:
+        raise ValueError("nothing to run: RUN_BASELINE is False and SW_WINDOWS is empty")
+    return ";".join(items)
+
+
 def main():
     args = parse_args()
+    if args.windows is None:
+        args.windows = windows_from_config(DEFAULT_CONFIG)
+    if args.merge_window is None:
+        args.merge_window = ",".join("on" if m else "off" for m in DEFAULT_CONFIG["MERGE"])
+    if args.col_order is None:
+        args.col_order = ",".join(DEFAULT_CONFIG["COL_ORDER"])
+    configs = parse_configs(args.windows, args.merge_window, args.col_order)
     codes = [c.strip() for c in args.codes.split(",")] if args.codes else DEFAULT_CONFIG["CODES"]
     rates = [float(r) for r in args.rates.split(",")] if args.rates else DEFAULT_CONFIG["ERROR_RATES"]
     te_spec = args.target_error if args.target_error is not None else DEFAULT_CONFIG["TARGET_ERROR"]
@@ -166,6 +189,7 @@ def main():
     print(f"  Codes:        {codes}")
     print(f"  Error Rates:  {rates}")
     print(f"  Windows:      {args.windows}  (merge: {args.merge_window}, col order: {args.col_order})")
+    print(f"  Configs:      {len(configs)} -> {', '.join(config_label(*c) for c in configs)}")
     print(f"  Algorithm:    {args.algo}")
     print(f"  BB schedule:  {args.bb_schedule}")
     print(f"  GPUs:         {gpus} (workers/gpu: {args.workers_per_gpu})")
