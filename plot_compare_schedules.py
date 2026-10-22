@@ -21,6 +21,7 @@ import os
 import re
 
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 from plot_results_v3 import BB_SCHEDULES, fast_extract_lers
 
@@ -30,6 +31,9 @@ SCHEDULE_STYLES = {
     "ibm": {"color": "#2ca02c", "marker": "^", "label": "ibm (IBM noise, X detectors only)"},
 }
 ALGO_TITLES = {"bposd": "BP + OSD-0", "lottery_bposd": "Lottery BP + OSD-0", "relay_bp": "Relay BP"}
+# overlay layout: decoder -> line style and marker fill (color stays the schedule)
+ALGO_STYLES = {"bposd": {"ls": "-", "fill": False}, "lottery_bposd": {"ls": "--", "fill": True},
+               "relay_bp": {"ls": ":", "fill": False}}
 
 
 def read_counts(path):
@@ -115,36 +119,70 @@ def print_table(data, codes, algos, schedules, ref):
     print("Points with < ~20 logical errors are noisy; compare them with their error bars.")
 
 
-def plot_code(data, code, algos, schedules, pure_bp, by_round, out_path):
+def draw_curve(ax, pts, pure_bp, by_round, color, marker, ls, fill, label):
+    xs, ys, es = [], [], []
+    for p in sorted(pts):
+        v, sig = point(pts[p], pure_bp, by_round)
+        if v is None or v <= 0:
+            continue
+        xs.append(p); ys.append(v); es.append(sig if sig is not None else 0)
+    if not xs:
+        return False
+    # keep the lower error bar above zero on a log axis
+    lower = [min(e, y * 0.999) for y, e in zip(ys, es)]
+    ax.errorbar(xs, ys, yerr=[lower, es], color=color, marker=marker, markersize=6, ls=ls,
+                markerfacecolor=color if fill else "none", lw=1.5, capsize=3, label=label)
+    return True
+
+
+def style_axis(ax, title):
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.set_xlabel("Physical Error Rate ($p$)", fontsize=11)
+    ax.tick_params(direction="in", which="both", top=True, right=True)
+    ax.grid(True, which="major", ls="-", color="gray", alpha=0.35)
+    ax.grid(True, which="minor", ls=":", color="gray", alpha=0.2)
+
+
+def plot_code(data, code, algos, schedules, pure_bp, by_round, out_path, layout="overlay"):
     algos = [a for a in algos if a in data.get(code, {})]
     if not algos:
         print(f"[SKIP] no results for BB {code}")
         return
-    fig, axes = plt.subplots(1, len(algos), figsize=(6.5 * len(algos), 5.5), dpi=200, sharey=True, squeeze=False)
-    for ax, algo in zip(axes[0], algos):
-        for s in schedules:
-            pts = data[code][algo].get(s, {})
-            xs, ys, es = [], [], []
-            for p in sorted(pts):
-                v, sig = point(pts[p], pure_bp, by_round)
-                if v is None or v <= 0:
-                    continue
-                xs.append(p); ys.append(v); es.append(sig if sig is not None else 0)
-            if not xs:
-                continue
-            st = SCHEDULE_STYLES.get(s, {"color": "gray", "marker": "x", "label": s})
-            # keep the lower error bar above zero on a log axis
-            lower = [min(e, y * 0.999) for y, e in zip(ys, es)]
-            ax.errorbar(xs, ys, yerr=[lower, es], color=st["color"], marker=st["marker"], markersize=6,
-                        markerfacecolor="none", lw=1.5, capsize=3, label=st["label"])
-        ax.set_xscale("log")
-        ax.set_yscale("log")
-        ax.set_title(ALGO_TITLES.get(algo, algo) + (" - BP only" if pure_bp else ""), fontsize=12, fontweight="bold")
-        ax.set_xlabel("Physical Error Rate ($p$)", fontsize=11)
-        ax.tick_params(direction="in", which="both", top=True, right=True)
-        ax.grid(True, which="major", ls="-", color="gray", alpha=0.35)
-        ax.grid(True, which="minor", ls=":", color="gray", alpha=0.2)
-        ax.legend(fontsize=8, loc="lower right", framealpha=0.9)
+    bp_tag = " - BP only" if pure_bp else ""
+    if layout == "overlay":
+        # one panel: color = schedule, line style / marker fill = decoder
+        fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
+        axes = [[ax]]
+        used_s, used_a = [], []
+        for algo in algos:
+            ast = ALGO_STYLES.get(algo, {"ls": "-.", "fill": False})
+            for s in schedules:
+                st = SCHEDULE_STYLES.get(s, {"color": "gray", "marker": "x", "label": s})
+                if draw_curve(ax, data[code][algo].get(s, {}), pure_bp, by_round, st["color"], st["marker"],
+                              ast["ls"], ast["fill"], None):
+                    used_s += [s] if s not in used_s else []
+                    used_a += [algo] if algo not in used_a else []
+        style_axis(ax, f"BP+OSD vs Lottery BP+OSD{bp_tag}")
+        sched_handles = [Line2D([0], [0], color=SCHEDULE_STYLES[s]["color"], marker=SCHEDULE_STYLES[s]["marker"],
+                                ls="-", markerfacecolor="none", label=SCHEDULE_STYLES[s]["label"])
+                         for s in used_s if s in SCHEDULE_STYLES]
+        algo_handles = [Line2D([0], [0], color="black", marker="o", ls=ALGO_STYLES.get(a, {"ls": "-."})["ls"],
+                               markerfacecolor="black" if ALGO_STYLES.get(a, {}).get("fill") else "none",
+                               label=ALGO_TITLES.get(a, a)) for a in used_a]
+        leg = ax.legend(handles=sched_handles, title="Circuit", fontsize=8, loc="lower right", framealpha=0.9)
+        ax.add_artist(leg)
+        ax.legend(handles=algo_handles, title="Decoder", fontsize=8, loc="upper left", framealpha=0.9)
+    else:
+        fig, axes = plt.subplots(1, len(algos), figsize=(6.5 * len(algos), 5.5), dpi=200, sharey=True, squeeze=False)
+        for ax, algo in zip(axes[0], algos):
+            for s in schedules:
+                st = SCHEDULE_STYLES.get(s, {"color": "gray", "marker": "x", "label": s})
+                draw_curve(ax, data[code][algo].get(s, {}), pure_bp, by_round, st["color"], st["marker"],
+                           "-", False, st["label"])
+            style_axis(ax, ALGO_TITLES.get(algo, algo) + bp_tag)
+            ax.legend(fontsize=8, loc="lower right", framealpha=0.9)
     axes[0][0].set_ylabel("Logical Error Rate per round" if by_round else "Logical Error Rate ($p_L$)", fontsize=11)
     fig.suptitle(f"BB [[{code}]] - circuit schedule comparison (STIM DEM)", fontsize=13, fontweight="bold")
     fig.tight_layout()
@@ -164,6 +202,8 @@ def main():
     ap.add_argument("--ref", default="7layer", help="schedule the table ratios are relative to")
     ap.add_argument("--pure-bp", action="store_true", help="plot BP-only LER (decoder_0) instead of BP+OSD")
     ap.add_argument("--per-round", action="store_true", help="plot 1-(1-p_L)^(1/rounds)")
+    ap.add_argument("--layout", default="overlay", choices=["overlay", "split"],
+                    help="overlay: decoders in one panel (line style = decoder); split: one panel per decoder")
     args = ap.parse_args()
 
     data = collect(args.results_dir)
@@ -172,10 +212,11 @@ def main():
     schedules = args.schedules.split(",")
 
     print_table(data, codes, algos, schedules, args.ref)
-    suffix = ("_pure_bp" if args.pure_bp else "") + ("_per_round" if args.per_round else "")
+    suffix = ("_pure_bp" if args.pure_bp else "") + ("_per_round" if args.per_round else "") + \
+             ("_split" if args.layout == "split" else "")
     for code in codes:
         plot_code(data, code, algos, schedules, args.pure_bp, args.per_round,
-                  os.path.join(args.output_dir, f"compare_BB_{code}_schedules{suffix}.png"))
+                  os.path.join(args.output_dir, f"compare_BB_{code}_schedules{suffix}.png"), args.layout)
 
 
 if __name__ == "__main__":
