@@ -125,8 +125,11 @@ def _build_7layer_bb_circuit(
     p_idle: float,
     p_data: float,
     sX: list = None,
-    sZ: list = None
+    sZ: list = None,
+    z_detectors: bool = True
 ) -> stim.Circuit:
+    # z_detectors=False keeps only the X-check detectors (binary Z-error decoding);
+    # the circuit and its noise are unchanged
     circuit = stim.Circuit()
     data_qubits = list(range(num_data))
     x_ancillas = list(range(num_data, num_data + num_x_checks))
@@ -207,7 +210,7 @@ def _build_7layer_bb_circuit(
                 circuit.append("DETECTOR", [rec_now, rec_prev], [i, r])
                 
         for j in range(num_z_checks):
-            if r > 0:
+            if r > 0 and z_detectors:
                 rec_now = stim.target_rec(offset + num_x_checks + j)
                 rec_prev = stim.target_rec(offset - len(all_ancillas) + num_x_checks + j)
                 circuit.append("DETECTOR", [rec_now, rec_prev], [num_x_checks + j, r])
@@ -216,7 +219,7 @@ def _build_7layer_bb_circuit(
 
     if p_meas > 0: circuit.append("Z_ERROR", data_qubits, p_meas)
     circuit.append("MX", data_qubits)
-    
+
     for i in range(num_x_checks):
         detector_targets = []
         for m_idx in range(6):
@@ -514,7 +517,7 @@ def generate_bb_interface_yaml(
             Hx_matrix=Hx, logical_x_matrix=Lx, rounds=rounds,
             p_data=error_rate, p_meas=error_rate
         )
-    elif schedule in ("ibm", "7layer", "stim") and bb_key in BB_CODE_DICT:
+    elif schedule in ("ibm", "7layer", "7layer_x", "stim") and bb_key in BB_CODE_DICT:
         ell, m_val, a1, a2, a3, b1, b2, b3 = BB_CODE_DICT[bb_key]
         matchings = get_bb_matchings(ell, m_val, a1, a2, a3, b1, b2, b3)
         num_data = 2 * ell * m_val
@@ -524,11 +527,13 @@ def generate_bb_interface_yaml(
                                             z_detectors=z_detectors)
         else:
             # "7layer": Stim generated-circuit conventions with the original CNOT order;
-            # "stim": the same circuit and noise with IBM's CNOT order (higher circuit distance)
+            # "7layer_x": the same circuit with X-check detectors only (binary Z-error decoding);
+            # "stim": the 7layer circuit and noise with IBM's CNOT order (higher circuit distance)
             sX, sZ = (IBM_SX, IBM_SZ) if schedule == "stim" else (None, None)
             circuit = _build_7layer_bb_circuit(
                 matchings, (0, 1, 2), (3, 4, 5), num_data, num_checks, num_checks,
-                Lx, rounds, error_rate, error_rate, error_rate, error_rate, sX=sX, sZ=sZ
+                Lx, rounds, error_rate, error_rate, error_rate, error_rate, sX=sX, sZ=sZ,
+                z_detectors=schedule != "7layer_x"
             )
     else:
         circuit = generate_bb_code_circuit_level(
@@ -599,9 +604,10 @@ if __name__ == "__main__":
     parser.add_argument("-r", "--rounds", type=int, default=0, help="Number of syndrome measurement rounds")
     parser.add_argument("-o", "--output", type=str, default="generated.interface.yaml", help="Output YAML path")
     parser.add_argument("--noise", type=str, default="CIRCUIT_LEVEL", choices=["CIRCUIT_LEVEL", "PHENOMENOLOGICAL"])
-    parser.add_argument("--schedule", type=str, default="ibm", choices=["ibm", "7layer", "stim", "greedy"],
+    parser.add_argument("--schedule", type=str, default="ibm", choices=["ibm", "7layer", "7layer_x", "stim", "greedy"],
                         help="BB circuit: 'ibm' = IBM depth-8 cycle and noise, '7layer' = Stim-convention 7-layer circuit, "
-                             "'stim' = 7layer with IBM's CNOT order, 'greedy' = greedy CNOT layering")
+                             "'7layer_x' = 7layer with X detectors only, 'stim' = 7layer with IBM's CNOT order, "
+                             "'greedy' = greedy CNOT layering")
     args = parser.parse_args()
 
     r = args.rounds if args.rounds > 0 else (args.distance if args.distance > 0 else None)

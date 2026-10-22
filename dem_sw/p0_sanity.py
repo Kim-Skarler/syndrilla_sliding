@@ -17,9 +17,9 @@ import scipy.sparse as sp
 from dem_tools import build_dem
 
 
-def check_full(code, p, rounds):
+def check_full(code, p, rounds, schedule):
     t = time.time()
-    d = build_dem(code, p, rounds)  # raises if any detector/observable is non-deterministic
+    d = build_dem(code, p, rounds, schedule)  # raises if any detector/observable is non-deterministic
     expect_det = d.num_checks * (d.rounds + 1)
     print(f"[full] code={code} rounds={d.rounds} p={p}: detectors={d.H.shape[0]} (expect {expect_det}), "
           f"observables={d.L.shape[0]}, error classes={d.H.shape[1]} ({time.time() - t:.1f}s)")
@@ -27,10 +27,10 @@ def check_full(code, p, rounds):
     return d
 
 
-def distance_upper_bound(code, p, rounds, trials, osd_order, seed):
+def distance_upper_bound(code, p, rounds, trials, osd_order, seed, schedule):
     from ldpc import BpOsdDecoder
 
-    d = build_dem(code, p, rounds)
+    d = build_dem(code, p, rounds, schedule)
     rng = np.random.default_rng(seed)
     L = d.L.toarray().astype(np.uint8)
     syndrome = np.zeros(d.H.shape[0] + 1, dtype=np.uint8)
@@ -56,6 +56,7 @@ def distance_upper_bound(code, p, rounds, trials, osd_order, seed):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--code", default="144")
+    ap.add_argument("--schedule", default="7layer_x", choices=["7layer_x", "ibm"])
     ap.add_argument("-p", type=float, default=0.003, help="only sets priors; structure does not depend on p")
     ap.add_argument("--rounds", type=int, default=12)
     ap.add_argument("--dist-rounds", type=int, nargs="*", default=[1, 2])
@@ -64,9 +65,9 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
-    check_full(args.code, args.p, args.rounds)
+    check_full(args.code, args.p, args.rounds, args.schedule)
     for r in args.dist_rounds:
-        distance_upper_bound(args.code, args.p, r, args.trials, args.osd_order, args.seed)
+        distance_upper_bound(args.code, args.p, r, args.trials, args.osd_order, args.seed, args.schedule)
 
 
 if __name__ == "__main__":

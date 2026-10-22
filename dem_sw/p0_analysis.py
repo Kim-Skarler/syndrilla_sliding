@@ -55,11 +55,12 @@ def check_hx_invariant(code, ell, m):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--code", default="144")
+    ap.add_argument("--schedule", default="7layer_x", choices=["7layer_x", "ibm"])
     ap.add_argument("--rounds", type=int, default=12)
     ap.add_argument("-p", type=float, default=0.003)
     args = ap.parse_args()
 
-    d = build_dem(args.code, args.p, args.rounds)
+    d = build_dem(args.code, args.p, args.rounds, args.schedule)
     _, _, _, bb_key, _ = load_bb_matrices(args.code, BB_SEARCH_BASE)
     ell, m = BB_CODE_DICT[bb_key][:2]
     R = d.rounds
@@ -69,7 +70,7 @@ def main():
     row_deg = np.asarray(d.H.sum(axis=1)).ravel()
     span = d.col_rmax - d.col_rmin
 
-    print(f"== code={args.code} rounds={R} p={args.p}: {d.H.shape[0]} detectors x {n_col} classes, "
+    print(f"== code={args.code} schedule={args.schedule} rounds={R} p={args.p}: {d.H.shape[0]} detectors x {n_col} classes, "
           f"{d.L.shape[0]} observables")
 
     # --- per-round statistics ---

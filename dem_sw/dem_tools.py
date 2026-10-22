@@ -1,4 +1,7 @@
-"""Build the BB memory-X circuit with the IBM schedule and split its DEM into H, L and priors.
+"""Build a BB memory-X circuit (X detectors only) and split its DEM into H, L and priors.
+
+Schedules: "7layer_x" (Stim-convention 7-layer circuit, X detectors only; default) or "ibm"
+(IBM decoder_setup.py circuit and noise).
 
 Run scripts from the repo root, or import after putting the repo root on sys.path.
 """
@@ -16,10 +19,12 @@ if REPO_ROOT not in sys.path:
 
 from tools.bb_circuit_generator import (  # noqa: E402
     BB_CODE_DICT,
-    _build_ibm_bb_circuit,
+    generate_bb_interface_yaml,
     get_bb_matchings,
     load_bb_matrices,
 )
+
+X_ONLY_SCHEDULES = ("7layer_x", "ibm")
 
 BB_SEARCH_BASE = os.path.join(REPO_ROOT, "examples", "txt", "BB")
 
@@ -41,23 +46,23 @@ class DemData:
     col_rmax: np.ndarray     # last round a class touches, -1 if it touches no detector
 
 
-def build_circuit(code: str = "144", p: float = 0.003, rounds: int = None) -> stim.Circuit:
-    """IBM depth-8 memory-X circuit; `rounds` defaults to the code distance."""
-    _, _, Lx, bb_key, dist = load_bb_matrices(code, BB_SEARCH_BASE)
+def build_circuit(code: str = "144", p: float = 0.003, rounds: int = None,
+                  schedule: str = "7layer_x") -> stim.Circuit:
+    """Memory-X circuit with X detectors only; `rounds` defaults to the code distance."""
+    if schedule not in X_ONLY_SCHEDULES:
+        raise ValueError(f"schedule <{schedule}> is not X-detector-only; use one of {X_ONLY_SCHEDULES}")
+    _, _, _, bb_key, dist = load_bb_matrices(code, BB_SEARCH_BASE)
     if bb_key not in BB_CODE_DICT:
         raise ValueError(f"code <{code}> has no polynomial parameters in BB_CODE_DICT")
-    ell, m = BB_CODE_DICT[bb_key][:2]
-    num_checks = ell * m
-    matchings = get_bb_matchings(*BB_CODE_DICT[bb_key])
-    return _build_ibm_bb_circuit(matchings, 2 * num_checks, num_checks, Lx,
-                                 rounds if rounds else dist, p)
+    return stim.Circuit(generate_bb_interface_yaml(code, p, rounds if rounds else dist, schedule=schedule,
+                                                   search_base=BB_SEARCH_BASE))
 
 
-def build_dem(code: str = "144", p: float = 0.003, rounds: int = None) -> DemData:
+def build_dem(code: str = "144", p: float = 0.003, rounds: int = None, schedule: str = "7layer_x") -> DemData:
     _, _, _, bb_key, dist = load_bb_matrices(code, BB_SEARCH_BASE)
     rounds = rounds if rounds else dist
     ell, m = BB_CODE_DICT[bb_key][:2]
-    circuit = build_circuit(code, p, rounds)
+    circuit = build_circuit(code, p, rounds, schedule)
     dem = circuit.detector_error_model(decompose_errors=False)
 
     coords = circuit.get_detector_coordinates()

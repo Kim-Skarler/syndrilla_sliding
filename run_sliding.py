@@ -2,7 +2,7 @@
 
 Each point writes interface.yaml (IBM circuit) and decoding.yaml, then runs
 `python -m syndrilla.main_sliding`, which decodes every window config on the same samples
-and writes results_sw/BB_<n>_ibm/p_<p>/sw_result.yaml (resumed when it already exists).
+and writes results_sw/BB_<n>_<schedule>/p_<p>/sw_result.yaml (resumed when it already exists).
 
 Usage (repo root):
   python run_sliding.py --codes 144 --rates 0.001,0.002,0.003,0.005 --gpus 0,1 --dry-run
@@ -24,6 +24,9 @@ DEFAULT_CONFIG = {
     "CODES": ["144"],
     "ERROR_RATES": [0.001, 0.002, 0.003, 0.005],
     # "0" baseline (whole DEM), "T" SW(T), "a,b" SW(T_BP=a, T_OSD=b)
+    # BB 電路: "7layer_x" (7layer 的 Stim 風格電路與雜訊，只宣告 X detectors，binary 解 Z 錯誤)
+    # 或 "ibm" (IBM decoder_setup.py 的電路與雜訊，只宣告 X detectors)
+    "BB_SCHEDULE": "7layer_x",
     "WINDOWS": "0;1;2;3;4;3,1;3,2;4,2",
     # merge columns made identical by window truncation: "off", "on", or "off,on" (both, same samples)
     "MERGE_WINDOW": "off",
@@ -33,7 +36,7 @@ DEFAULT_CONFIG = {
     "ALGO": "bposd",
     "BATCH_SIZE": 5000,
     # logical errors per config; low p is expensive, so it gets fewer
-    "TARGET_ERROR": {0.001: 20, 0.002: 50, 0.003: 100, 0.005: 200, "default": 100},
+    "TARGET_ERROR": {0.001: 5, 0.003: 50, 0.005: 100, 0.005: 200, 0.01: 500, "default": 100},
     "BASE_RESULT_DIR": "results_sw",
 }
 
@@ -82,7 +85,7 @@ def is_finished(point_dir, target_error, max_shots, num_configs):
 def worker_task(task, gpu_queue, args):
     code, rate, target_error = task
     _, bb_key, distance = resolve_bb_prefix(code)
-    point_dir = os.path.join(args.result_dir, f"BB_{code}_ibm", f"p_{rate}")
+    point_dir = os.path.join(args.result_dir, f"BB_{code}_{args.bb_schedule}", f"p_{rate}")
     num_configs = (len([w for w in args.windows.split(";") if w.strip()])
                    * len(args.merge_window.split(",")) * len(args.col_order.split(",")))
     if is_finished(point_dir, target_error, args.max_shots, num_configs):
@@ -93,7 +96,7 @@ def worker_task(task, gpu_queue, args):
     interface_yaml = os.path.join(point_dir, "interface.yaml")
     decoding_yaml = os.path.join(point_dir, "decoding.yaml")
     generate_bb_interface_yaml(code_type=code, error_rate=rate, rounds=distance,
-                               output_yaml_path=interface_yaml, schedule="ibm")
+                               output_yaml_path=interface_yaml, schedule=args.bb_schedule)
     # max_iter = n, the BP-family study convention
     max_iter = args.max_iter or int(bb_key)
     with open(decoding_yaml, "w", encoding="utf-8") as f:
@@ -130,6 +133,8 @@ def parse_args():
     ap = argparse.ArgumentParser(description="DEM sliding-window sweep runner")
     ap.add_argument("--codes", default=None, help="comma separated BB codes, e.g. '144,72'")
     ap.add_argument("--rates", default=None, help="comma separated physical error rates")
+    ap.add_argument("--bb-schedule", default=DEFAULT_CONFIG["BB_SCHEDULE"], choices=["7layer_x", "ibm"],
+                    help="BB circuit, X detectors only (default: 7layer_x)")
     ap.add_argument("--windows", default=DEFAULT_CONFIG["WINDOWS"])
     ap.add_argument("--merge-window", default=DEFAULT_CONFIG["MERGE_WINDOW"], help="off, on, or off,on")
     ap.add_argument("--col-order", default=DEFAULT_CONFIG["COL_ORDER"], help="comma separated: dem, prior, random")
@@ -162,6 +167,7 @@ def main():
     print(f"  Error Rates:  {rates}")
     print(f"  Windows:      {args.windows}  (merge: {args.merge_window}, col order: {args.col_order})")
     print(f"  Algorithm:    {args.algo}")
+    print(f"  BB schedule:  {args.bb_schedule}")
     print(f"  GPUs:         {gpus} (workers/gpu: {args.workers_per_gpu})")
     print("=" * 70)
 

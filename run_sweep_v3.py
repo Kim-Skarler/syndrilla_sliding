@@ -34,10 +34,10 @@ from tools.bb_circuit_generator import (
 # =====================================================================
 DEFAULT_CONFIG = {
     # 支援: "surface", "72", "144", "288", "360"
-    "CODES": ["72", "144", "288", "360", "surface"],
+    "CODES": ["72", "144", "surface", "288", "360"],
     
     # 針對 Surface code 的 distance 列表 (BB code 會自動依尺寸對應預設 distance)
-    "SURFACE_DISTANCES": [3, 9, 15, 21], # 3, 9, 15, 21
+    "SURFACE_DISTANCES": [3, 9, 15], # 3, 9, 15, 21
     
     # 物理錯誤率掃描列表
     "ERROR_RATES": [0.01, 0.005, 0.003, 0.001],
@@ -60,7 +60,7 @@ DEFAULT_CONFIG = {
     # - "7layer": 參考 Stim generated circuit 的結構與雜訊 (X+Z detectors)，原本的 CNOT 順序
     # - "stim":   同 7layer，但換成 IBM 的 CNOT 順序 (circuit distance 較高)
     # 結果存到 BB_<n>_<schedule>/
-    "BB_SCHEDULE": "ibm",
+    "BB_SCHEDULE": "7layer",
 
     # 預設執行參數
     "BATCH_SIZE": 5000,
@@ -88,7 +88,7 @@ def parse_args():
     parser.add_argument("-bs", "--batch-size", type=int, default=DEFAULT_CONFIG["BATCH_SIZE"], help="Batch size per step")
     parser.add_argument("-te", "--target-error", type=str, default=None, help="Target logical error count (e.g. '100' or '0.01:500,0.005:200,default:50')")
     parser.add_argument("--max-iter", type=str, default=str(DEFAULT_CONFIG["MAX_ITER"]), help="Max BP iterations (default: 'auto' to use code length n, or specify an integer)")
-    parser.add_argument("--bb-schedule", type=str, default=DEFAULT_CONFIG["BB_SCHEDULE"], choices=["ibm", "7layer", "stim"], help="BB circuit schedule and noise model (default: ibm)")
+    parser.add_argument("--bb-schedule", type=str, default=DEFAULT_CONFIG["BB_SCHEDULE"], choices=["ibm", "7layer", "stim"], help=f"BB circuit schedule and noise model (default: {DEFAULT_CONFIG['BB_SCHEDULE']})")
     parser.add_argument("--cpu", action="store_true", help="Force CPU execution")
     parser.add_argument("--dry-run", action="store_true", help="Print experiment points without running")
     parser.add_argument("-r", "--result-dir", type=str, default=DEFAULT_CONFIG["BASE_RESULT_DIR"], help="Output results directory")

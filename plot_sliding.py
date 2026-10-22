@@ -1,7 +1,7 @@
 """Plot sliding-window LER vs p, one line per window config, with the run_sweep_v3 baseline overlaid.
 
-Reads results_sw/BB_<n>_ibm/p_*/sw_result.yaml (written by run_sliding.py) and, for the
-cross-check, results/BB_<n>_ibm/d_*/<algo>/p_*/result_phy_err_*.yaml (run_sweep_v3.py).
+Reads results_sw/BB_<n>_<schedule>/p_*/sw_result.yaml (written by run_sliding.py) and, for the
+cross-check, results/BB_<n>_<schedule>/d_*/<algo>/p_*/result_phy_err_*.yaml (run_sweep_v3.py) when it exists.
 
 Usage (repo root): python plot_sliding.py --code 144
 """
@@ -33,10 +33,10 @@ STYLES = {  # label: (color, marker, linestyle)
 }
 
 
-def load_sw(base, code):
+def load_sw(base, code, schedule):
     data = {}  # label -> {p: ler}
     algo = None
-    for path in glob.glob(os.path.join(base, f"BB_{code}_ibm", "p_*", "sw_result.yaml")):
+    for path in glob.glob(os.path.join(base, f"BB_{code}_{schedule}", "p_*", "sw_result.yaml")):
         with open(path, encoding="utf-8") as f:
             res = yaml.safe_load(f)
         p = res["meta"].get("p")
@@ -48,9 +48,9 @@ def load_sw(base, code):
     return data, algo
 
 
-def load_sweep_baseline(base, code, algo):
+def load_sweep_baseline(base, code, algo, schedule):
     pts = {}
-    for path in glob.glob(os.path.join(base, f"BB_{code}_ibm", "d_*", algo, "p_*", "result_phy_err_*.yaml")):
+    for path in glob.glob(os.path.join(base, f"BB_{code}_{schedule}", "d_*", algo, "p_*", "result_phy_err_*.yaml")):
         m = re.search(r"p_([0-9.]+)", path)
         ler_osd, _ = fast_extract_lers(path)
         if m and ler_osd:
@@ -64,15 +64,16 @@ def main():
     ap.add_argument("--algo", default=None, help="sweep algo for the overlay (default: from sw_result meta)")
     ap.add_argument("--sw-dir", default=os.path.join(REPO_ROOT, "results_sw"))
     ap.add_argument("--sweep-dir", default=os.path.join(REPO_ROOT, "results"))
-    ap.add_argument("-o", "--output", default=None, help="default: plots/sliding_BB_<n>_ibm.png")
+    ap.add_argument("-o", "--output", default=None, help="default: plots/sliding_BB_<n>_<schedule>.png")
+    ap.add_argument("--schedule", default="7layer_x", help="BB circuit schedule of the run (default: 7layer_x)")
     args = ap.parse_args()
 
-    data, algo = load_sw(args.sw_dir, args.code)
+    data, algo = load_sw(args.sw_dir, args.code, args.schedule)
     if not data:
         print(f"[SKIP] no sliding-window results for BB_{args.code} in {args.sw_dir}")
         return
     algo = args.algo or algo
-    sweep = load_sweep_baseline(args.sweep_dir, args.code, algo)
+    sweep = load_sweep_baseline(args.sweep_dir, args.code, algo, args.schedule)
 
     fig, ax = plt.subplots(figsize=(8, 6), dpi=300)
     def style(label):
@@ -100,13 +101,13 @@ def main():
     ax.set_yscale("log")
     ax.set_xlabel("Physical Error Rate ($p$)", fontsize=12, fontweight="bold")
     ax.set_ylabel("Logical Error Rate ($p_L$)", fontsize=12, fontweight="bold")
-    ax.set_title(f"BB [[{args.code}]] IBM circuit - DEM sliding window ({algo})", fontsize=13, fontweight="bold")
+    ax.set_title(f"BB [[{args.code}]] {args.schedule} - DEM sliding window ({algo})", fontsize=13, fontweight="bold")
     ax.tick_params(direction="in", which="both", top=True, right=True)
     ax.grid(True, which="major", ls="-", color="gray", alpha=0.35)
     ax.grid(True, which="minor", ls=":", color="gray", alpha=0.2)
     ax.legend(title="Window (T_BP, T_OSD)", loc="lower right", framealpha=0.9)
 
-    out = args.output or os.path.join(REPO_ROOT, "plots", f"sliding_BB_{args.code}_ibm.png")
+    out = args.output or os.path.join(REPO_ROOT, "plots", f"sliding_BB_{args.code}_{args.schedule}.png")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     fig.tight_layout()
     fig.savefig(out)
