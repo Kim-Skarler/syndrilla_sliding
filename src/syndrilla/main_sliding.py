@@ -422,17 +422,26 @@ def run_decode(args, d, configs):
             "seed": args.seed, "dem_shape": list(d.H.shape)}
     keys = ("shots", "errors", "bp_conv", "bp_iter", "resid_nonzero", "time_s")
     stats = {c: dict.fromkeys(keys, 0) for c in configs}
-    if os.path.exists(out_path) and not args.fresh:
-        with open(out_path, encoding="utf-8") as f:
-            prev = yaml.safe_load(f) or {}
-        if prev.get("meta") == meta:
+    if os.path.exists(out_path):
+        try:
+            with open(out_path, encoding="utf-8") as f:
+                prev = yaml.safe_load(f) or {}
+        except yaml.YAMLError:
+            prev = {}
+        if not args.fresh and prev.get("meta") == meta:
             for c in configs:
                 r = prev["configs"].get(config_label(*c))
                 if r:
                     stats[c] = {k: r[k] for k in keys}
             print(f"[resume] {out_path}")
         else:
-            print(f"[fresh] {out_path} was written with other settings; starting over")
+            # Every config shares one sample stream seeded by the shot count, so a config
+            # list with different shot counts cannot be resumed piecewise; keep the old
+            # result and start over.
+            backup = f"{out_path}.{time.strftime('%Y%m%d-%H%M%S')}.bak"
+            os.replace(out_path, backup)
+            reason = "--fresh" if args.fresh else "written with other settings"
+            print(f"[fresh] {out_path} {reason}; kept as {os.path.basename(backup)}, starting over")
 
     def shots_done():
         return min(s["shots"] for s in stats.values())

@@ -34,18 +34,24 @@ STYLES = {  # label: (color, marker, linestyle)
 
 
 def load_sw(base, code, schedule):
-    data = {}  # label -> {p: ler}
-    algo = None
-    for path in glob.glob(os.path.join(base, f"BB_{code}_{schedule}", "p_*", "sw_result.yaml")):
+    """{algo: {label: {p: ler}}} from results_sw/BB_<n>_<schedule>/<algo>/p_*/ (and the older
+    layout without the algo folder)."""
+    data = {}
+    root = os.path.join(base, f"BB_{code}_{schedule}")
+    paths = glob.glob(os.path.join(root, "*", "p_*", "sw_result.yaml")) + \
+        glob.glob(os.path.join(root, "p_*", "sw_result.yaml"))
+    for path in paths:
         with open(path, encoding="utf-8") as f:
-            res = yaml.safe_load(f)
+            res = yaml.safe_load(f) or {}
+        if "meta" not in res:
+            continue
         p = res["meta"].get("p")
         p = float(p) if p is not None else float(re.search(r"p_([0-9.]+)", path).group(1).rstrip("."))
         algo = SWEEP_ALGO.get(res["meta"]["algorithm"][0], res["meta"]["algorithm"][0])
         for label, r in res["configs"].items():
             if r["errors"] > 0:
-                data.setdefault(label, {})[p] = r["ler"]
-    return data, algo
+                data.setdefault(algo, {}).setdefault(label, {})[p] = r["ler"]
+    return data
 
 
 def load_sweep_baseline(base, code, algo, schedule):
@@ -61,18 +67,26 @@ def load_sweep_baseline(base, code, algo, schedule):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--code", default="144")
-    ap.add_argument("--algo", default=None, help="sweep algo for the overlay (default: from sw_result meta)")
+    ap.add_argument("--algo", default=None, help="comma separated algos to plot (default: every algo found)")
     ap.add_argument("--sw-dir", default=os.path.join(REPO_ROOT, "results_sw"))
     ap.add_argument("--sweep-dir", default=os.path.join(REPO_ROOT, "results"))
-    ap.add_argument("-o", "--output", default=None, help="default: plots/sliding_BB_<n>_<schedule>.png")
+    ap.add_argument("-o", "--output-dir", default=os.path.join(REPO_ROOT, "plots"),
+                    help="writes sliding_BB_<n>_<schedule>_<algo>.png here")
     ap.add_argument("--schedule", default="7layer_x", help="BB circuit schedule of the run (default: 7layer_x)")
     args = ap.parse_args()
 
-    data, algo = load_sw(args.sw_dir, args.code, args.schedule)
-    if not data:
-        print(f"[SKIP] no sliding-window results for BB_{args.code} in {args.sw_dir}")
+    all_data = load_sw(args.sw_dir, args.code, args.schedule)
+    algos = args.algo.split(",") if args.algo else sorted(all_data)
+    if not any(all_data.get(a) for a in algos):
+        print(f"[SKIP] no sliding-window results for BB_{args.code}_{args.schedule} in {args.sw_dir}")
         return
-    algo = args.algo or algo
+    for algo in algos:
+        if all_data.get(algo):
+            plot_one(args, algo, all_data[algo])
+
+
+def plot_one(args, algo, data):
+    # run_sweep_v3 points of the same circuit, when they exist (none for X-only schedules)
     sweep = load_sweep_baseline(args.sweep_dir, args.code, algo, args.schedule)
 
     fig, ax = plt.subplots(figsize=(8, 6), dpi=300)
@@ -107,10 +121,11 @@ def main():
     ax.grid(True, which="minor", ls=":", color="gray", alpha=0.2)
     ax.legend(title="Window (T_BP, T_OSD)", loc="lower right", framealpha=0.9)
 
-    out = args.output or os.path.join(REPO_ROOT, "plots", f"sliding_BB_{args.code}_{args.schedule}.png")
-    os.makedirs(os.path.dirname(out), exist_ok=True)
+    out = os.path.join(args.output_dir, f"sliding_BB_{args.code}_{args.schedule}_{algo}.png")
+    os.makedirs(args.output_dir, exist_ok=True)
     fig.tight_layout()
     fig.savefig(out)
+    plt.close(fig)
     print(f"[SAVED] {out}")
 
 
