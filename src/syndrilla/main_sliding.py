@@ -14,6 +14,13 @@ Windows (stim_dem_migration_plan.md §2.2):
 - only classes with r_min == t are committed; they update the residual syndrome of later
   windows (H) and the predicted observables (L), so no data error vector is needed
 
+End of the run (`-fc`), both keep the hardware window at T_BP rounds:
+- round: slide to t = D - 1 and commit one round per window. The tail windows shrink, which
+  is the same decode as padding them to T_BP rounds with zero syndrome and saturated LLRs
+  (no class touches the padded rows, so BP and OSD-0 see two disconnected parts).
+- all ("+flush"): stop at the last full window t = D - T_BP and commit every remaining class
+  there, with OSD-0 on the whole BP window (T_OSD is raised to T_BP for that window only).
+
 Window merge and column order (§2.5), both switchable so their effect can be measured:
 - merge on: classes whose rows inside a window part are identical (a truncation side effect)
   become one column with prior P(odd number fire) = (1 - prod(1 - 2p)) / 2. When the OSD part
@@ -22,12 +29,16 @@ Window merge and column order (§2.5), both switchable so their effect can be me
 - column order sets the local index of each window column, which OSD-0's stable sort uses to
   break LLR ties: dem (Stim order), prior (largest prior first), random (fixed shuffle).
 
-Every combination of `-w`, `-mw` and `-co` decodes the same Stim samples. In `-w`, "0" is the
+Every combination of `-w`, `-mw`, `-co` and `-fc` decodes the same Stim samples. In `-w`, "0" is the
 baseline (one window holding the whole DEM), "T" is SW(T) with T_BP = T_OSD = T, and "a,b" is
 SW(T_BP=a, T_OSD=b).
 
   python -m syndrilla.main_sliding -r=<dir> -i=interface.yaml -d=decoding.yaml -w="0;1;2;3" -mw=off,on -te=100
   python -m syndrilla.main_sliding -i=interface.yaml --check     # window bookkeeping test, no torch
+
+Golden mode (`--golden <dir>`) decodes one batch of `-bs` samples with one window config and
+writes the OSD-0 calls of the windows whose OSD H equals the bulk window's as test patterns
+for the OSD hardware, without touching any result file (see GoldenDump).
 """
 import argparse
 import hashlib
@@ -41,6 +52,7 @@ import scipy.sparse as sp
 import yaml
 
 COL_ORDERS = ("dem", "prior", "random")
+FINAL_COMMITS = ("round", "all")
 
 
 # ----------------------------------------------------------------------------- DEM
@@ -116,9 +128,11 @@ def parse_windows(spec):
     return windows
 
 
-def parse_configs(windows_spec, merge_spec, order_spec):
-    """Every (T_BP, T_OSD, merge, column order) combination. The baseline runs unmerged
-    only: Stim already merged identical DEM columns, so a whole-DEM merge changes nothing."""
+def parse_configs(windows_spec, merge_spec, order_spec, final_spec="round"):
+    """Every (T_BP, T_OSD, merge, column order, flush) combination. The baseline runs unmerged
+    and unflushed only: Stim already merged identical DEM columns, so a whole-DEM merge
+    changes nothing, and its one window already commits everything. SW(1) never flushes:
+    its last full window is the last round, so the flush is the same decode."""
     merges = []
     for m in merge_spec.split(","):
         m = m.strip()
@@ -129,15 +143,19 @@ def parse_configs(windows_spec, merge_spec, order_spec):
     for o in orders:
         if o not in COL_ORDERS:
             raise ValueError(f"col_order entries are {COL_ORDERS}, got <{o}>")
+    finals = [f.strip() for f in final_spec.split(",")]
+    for f in finals:
+        if f not in FINAL_COMMITS:
+            raise ValueError(f"final_commit entries are {FINAL_COMMITS}, got <{f}>")
     configs = []
-    for (t_bp, t_osd), m, o in itertools.product(parse_windows(windows_spec), merges, orders):
-        cfg = (t_bp, t_osd, m and t_bp != 0, o)
+    for (t_bp, t_osd), m, o, f in itertools.product(parse_windows(windows_spec), merges, orders, finals):
+        cfg = (t_bp, t_osd, m and t_bp != 0, o, f == "all" and t_bp > 1)
         if cfg not in configs:
             configs.append(cfg)
     return configs
 
 
-def config_label(t_bp, t_osd, merge=False, order="dem"):
+def config_label(t_bp, t_osd, merge=False, order="dem", flush=False):
     if t_bp == 0:
         label = "baseline"
     else:
@@ -146,6 +164,8 @@ def config_label(t_bp, t_osd, merge=False, order="dem"):
         label += "+merge"
     if order != "dem":
         label += f"+{order}"
+    if flush:
+        label += "+flush"
     return label
 
 
@@ -198,9 +218,11 @@ class Window:
     """One window position: its BP part, its OSD part, how OSD columns read the BP output,
     and which OSD columns are committed."""
 
-    def __init__(self, d, t, t_bp, t_osd, merge, order, seed):
+    def __init__(self, d, t, t_bp, t_osd, merge, order, seed, final=False):
         D = d.rounds + 1
         rng = np.random.default_rng(seed + 1000 * t)
+        if final:  # flush: OSD on the whole BP window, every class in it committed
+            t_osd = t_bp
         if t_bp == 0:  # baseline: the whole DEM, committed at once
             rows = np.arange(d.H.shape[0])
             cols = np.arange(d.H.shape[1])
@@ -214,7 +236,7 @@ class Window:
             cols_osd = np.nonzero((d.col_rmin >= t) & (d.col_rmin < t + t_osd))[0]
             self.bp = WindowPart(d, rows_bp, cols_bp, merge, order, rng)
             self.osd = self.bp if t_osd == t_bp else WindowPart(d, rows_osd, cols_osd, merge, order, rng)
-            commit_round = t
+            commit_round = None if final else t
 
         # OSD column j reads BP columns bp_idx[j, :] (padded with -1): a plain copy when the
         # two parts hold the same group, a tanh-rule combination of single BP columns otherwise
@@ -244,10 +266,13 @@ class Window:
         self.commit_members = np.concatenate([self.osd.groups[j] for j in self.commit_pos])
 
 
-def build_windows(d, t_bp, t_osd, merge, order, seed):
+def build_windows(d, t_bp, t_osd, merge, order, flush, seed):
     if t_bp == 0:
         return [Window(d, 0, 0, 0, merge, order, seed)]
-    return [Window(d, t, t_bp, t_osd, merge, order, seed) for t in range(d.rounds + 1)]
+    if not flush:
+        return [Window(d, t, t_bp, t_osd, merge, order, seed) for t in range(d.rounds + 1)]
+    last = max(0, d.rounds + 1 - t_bp)  # last window that still holds T_BP rounds
+    return [Window(d, t, t_bp, t_osd, merge, order, seed, final=t == last) for t in range(last + 1)]
 
 
 def run_check(d, configs, shots, seed):
@@ -376,8 +401,9 @@ def osd_inputs(T, llr_bp, e_bp):
     return llr, e
 
 
-def decode_config(wd, d, windows, tensors, dets, H_t, L_t):
-    """Decode one batch with one config."""
+def decode_config(wd, d, windows, tensors, dets, H_t, L_t, dump=None):
+    """Decode one batch with one config. dump(t, synd, llr, e, conv) receives every OSD-0
+    call: window index, OSD syndrome, OSD-column LLR, OSD estimate and BP convergence."""
     import torch
 
     B = dets.shape[0]
@@ -385,7 +411,7 @@ def decode_config(wd, d, windows, tensors, dets, H_t, L_t):
     obs_pred = torch.zeros((B, d.L.shape[0]), dtype=torch.float32, device=wd.device)
     bp_conv = torch.zeros(B, device=wd.device)
     bp_iter = torch.zeros(B, device=wd.device)
-    for w, T in zip(windows, tensors):
+    for t, (w, T) in enumerate(zip(windows, tensors)):
         bp, H_bp = wd.get(w.bp, "bp")
         llr0 = T.llr0.unsqueeze(0).expand(B, -1).contiguous()
         out = bp({"synd": resid[:, T.rows_bp].long(), "llr0": llr0, "H_matrix": H_bp})
@@ -398,10 +424,206 @@ def decode_config(wd, d, windows, tensors, dets, H_t, L_t):
             o = osd({"synd": resid[:, T.rows_osd].long(), "llr": llr_osd, "e_v": e_osd,
                      "converge": conv, "iter": out["iter"].reshape(B)})
             e_osd = o["e_v"].reshape(B, -1)
+            if dump is not None:
+                dump(t, resid[:, T.rows_osd], llr_osd, e_osd, conv)
         e = e_osd[:, T.commit_pos].float()
         resid = ((resid.float() + e @ H_t[T.commit_rep]) % 2).to(resid.dtype)
         obs_pred = (obs_pred + e @ L_t[T.commit_rep]) % 2
     return obs_pred, resid, bp_conv / len(windows), bp_iter / len(windows)
+
+
+class GoldenDump:
+    """OSD-0 test patterns for the hardware, one line per OSD call (a BP-unconverged sample),
+    all on the bulk window's OSD H. A window with another OSD H (the tail of a round run)
+    is skipped, or with tail=True embedded in it: each of its columns sits on the bulk column with the same rows, the
+    other bulk columns are invalid (largest fixed-point LLR, sorted after every valid
+    column), and the golden result is OSD-0 in that order, compared with the window's own
+    decode in golden_meta.yaml. Files, those of the earlier OSD testbench first:
+        sorting_llr_input_hex.txt  N LLRs, two's complement Q(int_width).(frac_width) of
+                                   int_width + frac_width + 1 bits, column 0 first
+        sorting_syndrome.txt       the M syndrome bits as one hex number, bit i = row i
+        sorting_golden_idx.txt     the N column indices in OSD order (the ranking_method's
+                                   stable ascending key, invalid columns last), hex
+        sorting_osd_result.txt     the N-bit OSD estimate as one hex number, bit j = column j
+        sorting_col_valid.txt      the N column valid bits as one hex number, bit j = column j
+                                   (all ones except in an embedded window)
+        pattern_info.txt           pattern, sample, window t, syndrome weight, embedded per line
+        osd_H.txt                  the bulk OSD H, one row per line as a hex number, bit j = column j
+        osd_embed_t<t>.txt         for an embedded window t, the bulk column of each of its columns
+        golden_meta.yaml           formats, sizes, embedding counts and the run settings"""
+
+    def __init__(self, out_dir, windows, ranking, int_width, frac_width, meta, tail=False):
+        bulk = windows[len(windows) // 2].osd.H.tocsc()
+        self.H = bulk.toarray().astype(np.uint8)
+        by_rows = defaultdict(list)
+        for j in range(bulk.shape[1]):
+            by_rows[tuple(bulk.indices[bulk.indptr[j]:bulk.indptr[j + 1]])].append(j)
+        # embed[t]: bulk column of each column of window t, None when its OSD H is the bulk one
+        self.embed = []
+        for t, w in enumerate(windows):
+            h = w.osd.H.tocsc()
+            if h.shape == bulk.shape and (h != bulk).nnz == 0:
+                self.embed.append(None)
+                continue
+            if h.shape[0] != bulk.shape[0]:
+                raise ValueError(f"window {t}: OSD rows {h.shape[0]} differ from the bulk window's {bulk.shape[0]}")
+            free = {k: list(v) for k, v in by_rows.items()}
+            cols = []
+            for j in range(h.shape[1]):
+                slots = free.get(tuple(h.indices[h.indptr[j]:h.indptr[j + 1]]))
+                if not slots:
+                    raise ValueError(f"window {t}: column {j} has no bulk column with the same rows")
+                cols.append(slots.pop(0))
+            self.embed.append(np.array(cols))
+        self.out_dir, self.ranking, self.iw, self.fw, self.meta = out_dir, ranking, int_width, frac_width, meta
+        self.rows = []  # (sample, t, synd, llr, order, e, valid)
+        self.embedded = self.embedded_differ = self.skipped = 0
+        self.tail = tail
+
+    def __call__(self, t, synd, llr, e, conv):
+        import torch
+        from syndrilla.decoder.osd_0.ranking import ranking_key
+
+        idx = (conv == 0).nonzero(as_tuple=True)[0]
+        if not idx.numel():
+            return
+        llr_s, e_s, synd_s = llr[idx], e[idx], synd[idx]
+        cols = self.embed[t]
+        if cols is not None and not self.tail:
+            self.skipped += idx.numel()
+            return
+        N = self.H.shape[1]
+        valid = np.ones(N, dtype=np.uint8)
+        if cols is None:
+            order = torch.sort(ranking_key(llr_s, self.ranking, self.iw, self.fw), dim=1, stable=True).indices
+            order = order.cpu().numpy()
+            e_np = e_s.cpu().numpy().astype(np.uint8)
+        else:
+            # the window's columns on their bulk columns; every other column is invalid: the
+            # largest LLR and sorted after every valid column (a fixed-point LLR alone cannot
+            # do that, since valid columns reach the largest value and tie with it)
+            valid[:] = 0
+            valid[cols] = 1
+            top = ((1 << (self.iw + self.fw)) - 1) / (1 << self.fw)
+            full = llr_s.new_full((idx.numel(), N), top)
+            full[:, torch.as_tensor(cols, device=full.device)] = llr_s
+            key = ranking_key(full, self.ranking, self.iw, self.fw)
+            key[:, torch.as_tensor(valid == 0, device=key.device)] = key.max() + 1
+            order = torch.sort(key, dim=1, stable=True).indices.cpu().numpy()
+            synd_np = synd_s.cpu().numpy().astype(np.uint8)
+            e_np = np.stack([self._osd0(order[k], synd_np[k]) for k in range(idx.numel())])
+            back = np.zeros_like(e_np)
+            back[:, cols] = e_s.cpu().numpy().astype(np.uint8)
+            self.embedded += idx.numel()
+            self.embedded_differ += int((e_np != back).any(axis=1).sum())
+            llr_s = full
+        for k, b in enumerate(idx.tolist()):
+            self.rows.append((b, t, synd_s[k].cpu().numpy().astype(np.uint8), llr_s[k].cpu().numpy(),
+                              order[k], e_np[k], valid))
+
+    def _osd0(self, order, s):
+        """OSD-0 on the bulk H in a given column order: the first independent columns, solved
+        on them (the same estimate as osd_0 for a syndrome in their span)."""
+        M, N = self.H.shape
+        A = np.concatenate([self.H[:, order], s[:, None]], axis=1)
+        piv, r = [], 0
+        for j in range(N):
+            rows = np.nonzero(A[r:, j])[0]
+            if not rows.size:
+                continue
+            p = r + rows[0]
+            A[[r, p]] = A[[p, r]]
+            for q in np.nonzero(A[:, j])[0]:
+                if q != r:
+                    A[q] ^= A[r]
+            piv.append(j)
+            r += 1
+            if r == M:
+                break
+        e = np.zeros(N, dtype=np.uint8)
+        for k, j in enumerate(piv):
+            e[order[j]] = A[k, -1]
+        return e
+
+    @staticmethod
+    def _hex(bits):
+        """bit i of the number = bits[i], zero padded to ceil(len / 4) hex digits."""
+        value = int("".join("1" if b else "0" for b in bits[::-1]) or "0", 2)
+        return f"{value:0{(len(bits) + 3) // 4}x}"
+
+    def write(self):
+        os.makedirs(self.out_dir, exist_ok=True)
+        M, N = self.H.shape
+        bits = self.iw + self.fw
+        limit = 1 << bits
+        mask = (1 << (bits + 1)) - 1
+        llr_digits, idx_digits = (bits + 1 + 3) // 4, max(1, ((N - 1).bit_length() + 3) // 4)
+        names = ("sorting_llr_input_hex.txt", "sorting_syndrome.txt", "sorting_golden_idx.txt",
+                 "sorting_osd_result.txt", "sorting_col_valid.txt", "pattern_info.txt")
+        files = {name: open(os.path.join(self.out_dir, name), "w", encoding="utf-8", newline="\n")
+                 for name in names}
+        bad = 0
+        try:
+            files["pattern_info.txt"].write("# pattern sample window_t syndrome_weight embedded\n")
+            for n, (b, t, synd, llr, order, e, valid) in enumerate(self.rows):
+                v = np.clip(np.round(llr * (1 << self.fw)), -limit, limit - 1).astype(np.int64)
+                if not np.array_equal(v / (1 << self.fw), llr):
+                    raise ValueError("OSD LLR is not on the fixed-point grid: golden mode needs a "
+                                     "quantized BP with the same int_width / frac_width")
+                files["sorting_llr_input_hex.txt"].write(" ".join(f"{x & mask:0{llr_digits}x}" for x in v) + "\n")
+                files["sorting_syndrome.txt"].write(self._hex(synd) + "\n")
+                files["sorting_golden_idx.txt"].write(" ".join(f"{x:0{idx_digits}x}" for x in order) + "\n")
+                files["sorting_osd_result.txt"].write(self._hex(e) + "\n")
+                files["sorting_col_valid.txt"].write(self._hex(valid) + "\n")
+                files["pattern_info.txt"].write(f"{n} {b} {t} {int(synd.sum())} {int(not valid.all())}\n")
+                bad += int(((self.H.astype(np.int64) @ e) % 2 != synd).any())
+        finally:
+            for f in files.values():
+                f.close()
+        with open(os.path.join(self.out_dir, "osd_H.txt"), "w", encoding="utf-8", newline="\n") as f:
+            for row in self.H:
+                f.write(self._hex(row) + "\n")
+        for t, cols in enumerate(self.embed):
+            if cols is not None:
+                with open(os.path.join(self.out_dir, f"osd_embed_t{t}.txt"), "w", encoding="utf-8",
+                          newline="\n") as f:
+                    f.write(" ".join(f"{c:0{idx_digits}x}" for c in cols) + "\n")
+        info = {**self.meta, "patterns": len(self.rows), "patterns_not_matching_syndrome": bad,
+                "M": int(M), "N": int(N), "ranking_method": self.ranking, "int_width": self.iw,
+                "frac_width": self.fw, "llr_hex_digits": llr_digits, "idx_hex_digits": idx_digits,
+                "tail_windows": [t for t, c in enumerate(self.embed) if c is not None],
+                "tail_embedded": self.tail, "tail_osd_calls_skipped": self.skipped,
+                "embedded_patterns": self.embedded,
+                "embedded_patterns_differing_from_window_decode": self.embedded_differ}
+        with open(os.path.join(self.out_dir, "golden_meta.yaml"), "w", encoding="utf-8") as f:
+            yaml.safe_dump(info, f, sort_keys=False)
+        tail = (f"{self.embedded} tail calls embedded, {self.embedded_differ} of them differing from the "
+                f"window decode" if self.tail else f"{self.skipped} tail calls skipped")
+        print(f"[golden] {len(self.rows)} patterns ({tail}; {bad} not matching their syndrome) -> {self.out_dir}")
+
+
+def run_golden(args, d, configs, wd, windows, tensors, H_t, L_t, device, meta):
+    """One batch of -bs samples, one config, its OSD-0 calls written by GoldenDump."""
+    import torch
+
+    if len(configs) != 1:
+        raise ValueError(f"golden mode takes one window config, got {[config_label(*c) for c in configs]}")
+    c = configs[0]
+    osd_cfg = wd.stages["osd"].get("config") or {}
+    bp_cfg = wd.stages["bp"].get("config") or {}
+    iw = osd_cfg.get("int_width", bp_cfg.get("int_width"))
+    fw = osd_cfg.get("frac_width", bp_cfg.get("frac_width"))
+    if iw is None or fw is None:
+        raise ValueError("golden mode needs a fixed-point format: int_width / frac_width in the BP or OSD config")
+    dump = GoldenDump(args.golden, windows[c], osd_cfg.get("ranking_method", "standard"), int(iw), int(fw),
+                      {**meta, "config": config_label(*c), "batch_size": args.batch_size}, args.golden_tail)
+    dets_np, obs_np, _ = d.dem.compile_sampler(seed=args.seed).sample(args.batch_size)
+    dets = torch.as_tensor(dets_np.astype(np.uint8), device=device)
+    obs = torch.as_tensor(obs_np.astype(np.float32), device=device)
+    obs_pred, _, _, _ = decode_config(wd, d, windows[c], tensors[c], dets, H_t, L_t, dump)
+    dump.write()
+    print(f"[golden] {config_label(*c)}: {int((obs_pred != obs).any(dim=1).sum())} logical errors "
+          f"in {args.batch_size} samples")
 
 
 def run_decode(args, d, configs):
@@ -419,25 +641,29 @@ def run_decode(args, d, configs):
     meta = {"interface": os.path.abspath(args.interface_yaml), "algorithm": algos,
             "bp_config": stages[0].get("config", {}), "p": args.p, "rounds": d.rounds,
             "windows": args.windows, "merge_window": args.merge_window, "col_order": args.col_order,
-            "seed": args.seed, "dem_shape": list(d.H.shape)}
+            "final_commit": args.final_commit, "seed": args.seed, "dem_shape": list(d.H.shape)}
+    if args.golden:
+        return run_golden(args, d, configs, wd, windows, tensors, H_t, L_t, device, meta)
     keys = ("shots", "errors", "bp_conv", "bp_iter", "resid_nonzero", "time_s")
     stats = {c: dict.fromkeys(keys, 0) for c in configs}
+    kept = {}  # configs of the result file this run does not decode, written back unchanged
     if os.path.exists(out_path):
         try:
             with open(out_path, encoding="utf-8") as f:
                 prev = yaml.safe_load(f) or {}
         except yaml.YAMLError:
             prev = {}
-        if not args.fresh and prev.get("meta") == meta:
-            for c in configs:
-                r = prev["configs"].get(config_label(*c))
-                if r:
-                    stats[c] = {k: r[k] for k in keys}
-            print(f"[resume] {out_path}")
+        if not args.fresh and same_run(prev.get("meta") or {}, meta):
+            by_label = {config_label(*c): c for c in configs}
+            for label, r in (prev.get("configs") or {}).items():
+                if label in by_label:
+                    stats[by_label[label]] = {k: r[k] for k in keys}
+                else:
+                    kept[label] = r
+            new = [label for label in by_label if label not in (prev.get("configs") or {})]
+            print(f"[resume] {out_path}" + (f", new configs from shot 0: {', '.join(new)}" if new else ""))
         else:
-            # Every config shares one sample stream seeded by the shot count, so a config
-            # list with different shot counts cannot be resumed piecewise; keep the old
-            # result and start over.
+            # other code, noise or decoder settings: keep the old result and start over
             backup = f"{out_path}.{time.strftime('%Y%m%d-%H%M%S')}.bak"
             os.replace(out_path, backup)
             reason = "--fresh" if args.fresh else "written with other settings"
@@ -449,12 +675,17 @@ def run_decode(args, d, configs):
     batch = 0
     while (min(s["errors"] for s in stats.values()) < args.target_error
            and (args.max_shots <= 0 or shots_done() < args.max_shots)):
-        # seeding by the shot count keeps a resumed run on fresh samples
-        sampler = d.dem.compile_sampler(seed=args.seed + shots_done())
+        # The batch at shot offset o is sampled with seed + o, so a config added later
+        # replays the batches the others already decoded (the same samples while the batch
+        # size is unchanged) and the others wait until it has caught up.
+        offset = shots_done()
+        sampler = d.dem.compile_sampler(seed=args.seed + offset)
         dets_np, obs_np, _ = sampler.sample(args.batch_size)
         dets = torch.as_tensor(dets_np.astype(np.uint8), device=device)
         obs = torch.as_tensor(obs_np.astype(np.float32), device=device)
         for c in configs:
+            if stats[c]["shots"] != offset:
+                continue
             t0 = time.time()
             obs_pred, resid, conv, iters = decode_config(wd, d, windows[c], tensors[c], dets, H_t, L_t)
             if device.type == "cuda":
@@ -467,21 +698,30 @@ def run_decode(args, d, configs):
             s["resid_nonzero"] += int(resid.any(dim=1).sum())
             s["time_s"] += time.time() - t0
         batch += 1
-        save(out_path, meta, stats, windows, d)
+        save(out_path, meta, stats, windows, d, kept)
         print(f"[batch {batch}] shots={shots_done()} " +
               " ".join(f"{config_label(*c)}={stats[c]['errors']}" for c in configs), flush=True)
-    save(out_path, meta, stats, windows, d)
+    save(out_path, meta, stats, windows, d, kept)
     print(f"[saved] {out_path}")
 
 
-def save(path, meta, stats, windows, d):
-    res = {}
+# meta keys that only pick the config list; the rest must match for a result file to be resumed
+CONFIG_LIST_KEYS = ("windows", "merge_window", "col_order", "final_commit")
+
+
+def same_run(prev, meta):
+    drop = lambda m: {k: v for k, v in m.items() if k not in CONFIG_LIST_KEYS}
+    return drop(prev) == drop(meta)
+
+
+def save(path, meta, stats, windows, d, kept=None):
+    res = dict(kept or {})
     for c, s in stats.items():
         n = max(s["shots"], 1)
         ler = s["errors"] / n
         bulk = windows[c][len(windows[c]) // 2]
         res[config_label(*c)] = {
-            "t_bp": c[0], "t_osd": c[1], "merge": c[2], "col_order": c[3], **s,
+            "t_bp": c[0], "t_osd": c[1], "merge": c[2], "col_order": c[3], "flush": c[4], **s,
             "ler": ler,
             "ler_per_round": 1 - (1 - ler) ** (1 / d.rounds) if ler < 1 else 1.0,
             "bp_conv_rate": s["bp_conv"] / n,
@@ -507,6 +747,8 @@ def parse_commandline_args():
                     help="merge columns made identical by window truncation: off, on, or off,on")
     ap.add_argument("-co", "--col_order", default="dem",
                     help=f"window column order for OSD tie-breaks, comma separated from {COL_ORDERS}")
+    ap.add_argument("-fc", "--final_commit", default="round",
+                    help="end of run: round (slide to the end), all (flush the last full window), or round,all")
     ap.add_argument("-bs", "--batch_size", type=int, default=5000)
     ap.add_argument("-te", "--target_error", type=int, default=100,
                     help="stop once every config has at least this many logical errors")
@@ -517,13 +759,18 @@ def parse_commandline_args():
     ap.add_argument("--cpu", action="store_true")
     ap.add_argument("--check", action="store_true", help="window bookkeeping test with the true errors")
     ap.add_argument("--check_shots", type=int, default=200)
+    ap.add_argument("--golden", default=None,
+                    help="write OSD hardware test patterns of one batch (-bs samples, one config) to this "
+                         "directory and stop; no result file is read or written")
+    ap.add_argument("--golden_tail", action="store_true",
+                    help="golden: also write the tail window, embedded in the bulk OSD H with invalid columns")
     return ap.parse_args()
 
 
 def main():
     args = parse_commandline_args()
     d = Dem(load_circuit(args.interface_yaml))
-    configs = parse_configs(args.windows, args.merge_window, args.col_order)
+    configs = parse_configs(args.windows, args.merge_window, args.col_order, args.final_commit)
     print(f"DEM={d.H.shape} rounds={d.rounds} configs={[config_label(*c) for c in configs]}")
     if args.check:
         run_check(d, configs, args.check_shots, args.seed)
