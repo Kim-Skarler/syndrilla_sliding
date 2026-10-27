@@ -3,6 +3,7 @@ from loguru import logger
 
 from syndrilla.decoder.knobs import SHARED_CONFIG_KEYS, knob, reject_unknown_keys
 from syndrilla.decoder.osd_0.osd_0_cuda import create as _osd_0_cuda
+from syndrilla.decoder.osd_0.ranking import RANKING_METHODS, ranking_key
 from syndrilla.utils import parse_device_dtype
 
 
@@ -50,6 +51,11 @@ class create(torch.nn.Module):
         memory_opt      : bool (default true; false makes the defaults of
                           column_scan and packed_transform false and of
                           workspace_bytes 1 << 60)
+        ranking_method  : str (default standard; hardware_user or hardware_lzc
+                          order the columns by a coarse grade of the fixed-point
+                          LLR, see ranking.ranking_key)
+        int_width, frac_width : int (default 4, 4; the fixed-point format the
+                          hardware ranking methods round the LLR to)
     """
 
     _config_algorithm = "osd_0"
@@ -58,6 +64,7 @@ class create(torch.nn.Module):
         "workspace_bytes", "early_stop", "prefix_scan",
         "solve_by_pivots", "skip_converged", "column_scan",
         "packed_transform", "pruning_opt", "memory_opt",
+        "ranking_method", "int_width", "frac_width",
     })
 
     def __init__(self,
@@ -96,6 +103,11 @@ class create(torch.nn.Module):
         self.skip_converged = bool(knob(decoding_cfg, 'skip_converged', True))
         self.column_scan = bool(knob(decoding_cfg, 'column_scan', True))
         self.packed_transform = bool(knob(decoding_cfg, 'packed_transform', True))
+        self.ranking_method = knob(decoding_cfg, 'ranking_method', 'standard')
+        if self.ranking_method not in RANKING_METHODS:
+            raise ValueError(f'ranking_method must be one of {RANKING_METHODS}, got {self.ranking_method!r}')
+        self.int_width = int(knob(decoding_cfg, 'int_width', 4))
+        self.frac_width = int(knob(decoding_cfg, 'frac_width', 4))
         # Columns of the reliability order the scan tries first, as in
         # osd_0_cuda; the whole order without prefix_scan or column_scan.
         N = int(H_shape[1])
@@ -120,7 +132,8 @@ class create(torch.nn.Module):
             run = idx
         else:
             run = torch.arange(B, device=device) if defer is None else (~defer).nonzero(as_tuple=True)[0].to(device)
-        llr_sub = io_dict['llr'].to(self.dtype)[run]
+        llr_sub = ranking_key(io_dict['llr'].to(self.dtype)[run], self.ranking_method,
+                              self.int_width, self.frac_width)
         synd_sub = io_dict['synd'][run].to(torch.bool)
         N = self.cols.shape[0] - 1
 

@@ -8,6 +8,7 @@ import torch.nn as nn
 from loguru import logger
 
 from syndrilla.decoder.knobs import SHARED_CONFIG_KEYS, knob, reject_unknown_keys
+from syndrilla.decoder.osd_0.ranking import RANKING_METHODS, ranking_key
 
 _EXT = None  # module-level cache; compiled once per Python process
 
@@ -148,6 +149,12 @@ class create(nn.Module):
         memory_opt      : bool         (default true; false makes the defaults of
                                         column_scan false and of workspace_bytes
                                         1 << 60)
+        ranking_method  : str          (default standard; hardware_user or
+                                        hardware_lzc order the columns by a coarse
+                                        grade of the fixed-point LLR, see
+                                        ranking.ranking_key)
+        int_width, frac_width : int    (default 4, 4; the fixed-point format the
+                                        hardware ranking methods round the LLR to)
     """
 
     _config_algorithm = "osd_0"
@@ -156,6 +163,7 @@ class create(nn.Module):
         "fused", "workspace_bytes", "early_stop", "prefix_scan",
         "solve_by_pivots", "skip_converged", "column_scan",
         "packed_transform", "pruning_opt", "memory_opt",
+        "ranking_method", "int_width", "frac_width",
     })
 
     def __init__(self, decoding_cfg: dict, **kwargs) -> None:
@@ -212,6 +220,13 @@ class create(nn.Module):
         self.solve_by_pivots = bool(knob(decoding_cfg, "solve_by_pivots", True))
         self.skip_converged = bool(knob(decoding_cfg, "skip_converged", True))
         self.column_scan = bool(knob(decoding_cfg, "column_scan", True))
+        self.ranking_method = knob(decoding_cfg, "ranking_method", "standard")
+        if self.ranking_method not in RANKING_METHODS:
+            raise ValueError(
+                f"ranking_method must be one of {RANKING_METHODS}, got {self.ranking_method!r}"
+            )
+        self.int_width = int(knob(decoding_cfg, "int_width", 4))
+        self.frac_width = int(knob(decoding_cfg, "frac_width", 4))
         # Rows of T the pivot scan stores per sample (Tr, TuT); see _scan.
         self.pool_rows = min(self.M, max(64, (self.M + 5) // 6))
         self.pool_cols = min(self.M, max(64, (self.M + 2) // 3))
@@ -311,7 +326,10 @@ class create(nn.Module):
         else:
             run = (~defer).nonzero(as_tuple=True)[0].to(dev)
         if run.numel() > 0:
-            llr_sub = io_dict["llr"].to(dtype=self.dtype, device=dev)[run]
+            llr_sub = ranking_key(
+                io_dict["llr"].to(dtype=self.dtype, device=dev)[run],
+                self.ranking_method, self.int_width, self.frac_width,
+            )
             synd_sub = io_dict["synd"].to(device=dev)[run]
 
             # Column order: most reliable handling matches osd_0.py:140
