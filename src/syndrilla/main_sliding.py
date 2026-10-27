@@ -507,7 +507,8 @@ class GoldenDump:
             top = ((1 << (self.iw + self.fw)) - 1) / (1 << self.fw)
             full = llr_s.new_full((idx.numel(), N), top)
             full[:, torch.as_tensor(cols, device=full.device)] = llr_s
-            key = ranking_key(full, self.ranking, self.iw, self.fw)
+            # a copy: the standard key is the LLR tensor itself
+            key = ranking_key(full, self.ranking, self.iw, self.fw).clone()
             key[:, torch.as_tensor(valid == 0, device=key.device)] = key.max() + 1
             order = torch.sort(key, dim=1, stable=True).indices.cpu().numpy()
             synd_np = synd_s.cpu().numpy().astype(np.uint8)
