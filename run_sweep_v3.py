@@ -95,6 +95,8 @@ def parse_args():
     parser.add_argument("--bb-schedule", type=str, default=DEFAULT_CONFIG["BB_SCHEDULE"], choices=["ibm", "7layer", "stim"], help=f"BB circuit schedule and noise model (default: {DEFAULT_CONFIG['BB_SCHEDULE']})")
     parser.add_argument("--cpu", action="store_true", help="Force CPU execution")
     parser.add_argument("--dry-run", action="store_true", help="Print experiment points without running")
+    parser.add_argument("--count-tasks", action="store_true", help="Print the number of experiment points and exit (for Slurm --array sizing)")
+    parser.add_argument("--task-index", type=int, default=None, help="Run only the experiment point at this index (Slurm array task)")
     parser.add_argument("-r", "--result-dir", type=str, default=DEFAULT_CONFIG["BASE_RESULT_DIR"], help="Output results directory")
     return parser.parse_args()
 
@@ -456,6 +458,14 @@ def main():
                 args.batch_size, pt_target_error, pt_max_iter,
                 args.result_dir, args.cpu, args.bb_schedule
             ))
+
+    if args.count_tasks:
+        print(len(tasks))
+        return
+    if args.task_index is not None:
+        if not 0 <= args.task_index < len(tasks):
+            sys.exit(f"--task-index {args.task_index} 超出範圍 (共 {len(tasks)} 個點)")
+        tasks = [tasks[args.task_index]]
 
     print("=" * 70)
     print("  SYNDRILLA SWEEP RUNNER v3")
