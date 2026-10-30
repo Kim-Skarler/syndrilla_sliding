@@ -49,6 +49,7 @@ BB_SCHEDULES = ("ibm", "stim", "7layer")
 DECODER_STYLES_BPOSD = {
     "bposd": {"marker": "o", "ls": "-", "label": "BP + OSD-0"},
     "lottery_bposd": {"marker": "s", "ls": "--", "label": "Lottery BP + OSD-0 (PRE)"},
+    "lottery_bposd_new_arrangement": {"marker": "D", "ls": "-.", "label": "Lottery BP + OSD-0 (PRE, new arrangement)"},
     "bp_norm_min_sum": {"marker": "o", "ls": "-", "label": "BP + OSD-0"},
     "bp_lottery": {"marker": "s", "ls": "--", "label": "Lottery BP + OSD-0"},
     "relay_bp": {"marker": "^", "ls": ":", "label": "Relay BP"},
@@ -57,6 +58,7 @@ DECODER_STYLES_BPOSD = {
 DECODER_STYLES_PURE_BP = {
     "bposd": {"marker": "^", "ls": "-", "label": "BP (NMS)"},
     "lottery_bposd": {"marker": "o", "ls": "--", "label": "Lottery BP"},
+    "lottery_bposd_new_arrangement": {"marker": "D", "ls": "-.", "label": "Lottery BP (new arrangement)"},
     "bp_norm_min_sum": {"marker": "^", "ls": "-", "label": "BP (NMS)"},
     "bp_lottery": {"marker": "o", "ls": "--", "label": "Lottery BP"},
     "relay_bp": {"marker": "s", "ls": ":", "label": "Relay BP"},

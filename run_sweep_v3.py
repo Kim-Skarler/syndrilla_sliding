@@ -12,6 +12,7 @@ Features:
 
 import os
 import sys
+import math
 import time
 import argparse
 import subprocess
@@ -34,24 +35,27 @@ from tools.bb_circuit_generator import (
 # =====================================================================
 DEFAULT_CONFIG = {
     # 支援: "surface", "72", "144", "288", "360"
-    "CODES": ["72", "144", "surface", "288", "360"],
+    "CODES": ["72", "144", "288", "360"],
     
     # 針對 Surface code 的 distance 列表 (BB code 會自動依尺寸對應預設 distance)
-    "SURFACE_DISTANCES": [3, 9, 15], # 3, 9, 15, 21
+    "SURFACE_DISTANCES": [3, 9, 15, 21], # 3, 9, 15, 21
     
     # 物理錯誤率掃描列表
     "ERROR_RATES": [0.01, 0.005, 0.003, 0.001],
     
     # 解碼演算法清單:
     # - "bposd": 標準 Normalized Min-Sum + OSD-0
-    # - "lottery_bposd": 新版 Lottery BP (內建 16x5 輪 PRE) + OSD-0
+    # - "lottery_bposd": 新版 Lottery BP (內建 16x5 輪 PRE) + OSD-0，固定排程 flip_phase_iters=40, pre_max_lambda=16, pre_max_iter=5
+    # - "lottery_bposd_new_arrangement": 同 lottery_bposd，排程依 bb_lottery_pre_setup.md，
+    #   fpi 與 pmi 依 (d, p, max_iter) 推導 (只支援 BB)
     # - "relay_bp": Relay BP-S (純 BP 多 leg 擾動，不含 OSD，依碼別動態注入參數)
     "BP_ALGOS": [
-        "bposd",
-        "lottery_bposd"
+        # "bposd",
+        # "lottery_bposd",
+        "lottery_bposd_new_arrangement"
         # "relay_bp"
     ],
-    
+
     # 雜訊模型: "CIRCUIT_LEVEL" 或 "PHENOMENOLOGICAL"
     "NOISE_MODEL": "CIRCUIT_LEVEL",
 
@@ -63,13 +67,13 @@ DEFAULT_CONFIG = {
     "BB_SCHEDULE": "7layer",
 
     # 預設執行參數
-    "BATCH_SIZE": 5000,
+    "BATCH_SIZE": 2500,
     # TARGET_ERROR 支援單一整數 (全域共用) 或 dict (依物理錯誤率分級設置)
     "TARGET_ERROR": {
         0.01: 200,
         0.005: 100,
-        0.003: 10,
-        0.001: 5,
+        0.003: 20,
+        0.001: 10,
         "default": 100
     },
     # MAX_ITER 支援 "auto" (自動依碼長 n 設置: BB 72->72, 144->144, 360->360; Surface->2d(d-1)+1) 或指定整數
@@ -94,17 +98,47 @@ def parse_args():
     parser.add_argument("-r", "--result-dir", type=str, default=DEFAULT_CONFIG["BASE_RESULT_DIR"], help="Output results directory")
     return parser.parse_args()
 
-def build_decoding_config(algo: str, max_iter: int, code_type: str = "144", use_cpu: bool = False) -> dict:
+LOTTERY_NEW_PRE_MAX_LAMBDA = 16
+
+def lottery_new_arrangement_knobs(distance: int, rate: float, max_iter: int, pre_max_lambda: int = LOTTERY_NEW_PRE_MAX_LAMBDA) -> tuple:
+    """
+    bb_lottery_pre_setup.md 的 BB 排程，回傳 (fpi, pmi):
+    - w   = floor(2 + 4880·d²·p²)   首次收斂 CDF 斜率最大的 iteration
+    - cap = floor(2520·d^0.6·p)     95% 收斂的 iteration
+    - fpi = max(min(n − Λ·w, cap), w)
+    - pmi = max(1, ceil((n − fpi) / Λ))
+    """
+    w = math.floor(2 + 4880 * distance ** 2 * rate ** 2)
+    cap = math.floor(2520 * distance ** 0.6 * rate)
+    fpi = max(min(max_iter - pre_max_lambda * w, cap), w)
+    pmi = max(1, math.ceil((max_iter - fpi) / pre_max_lambda))
+    return fpi, pmi
+
+def build_decoding_config(algo: str, max_iter: int, code_type: str = "144", use_cpu: bool = False,
+                          distance: int = None, error_rate: float = None) -> dict:
     device_type = "cpu" if use_cpu else "cuda"
-    
+
     cfg_inner = {
         "max_iter": int(max_iter)
     }
-    
+
     if algo == "bposd":
         algorithm_val = ["bp_norm_min_sum", "osd_0"]
     elif algo == "lottery_bposd":
         algorithm_val = ["bp_lottery", "osd_0"]
+    elif algo == "lottery_bposd_new_arrangement":
+        if str(code_type).lower() == "surface":
+            raise ValueError("lottery_bposd_new_arrangement 只支援 BB code")
+        algorithm_val = ["bp_lottery", "osd_0"]
+        fpi, pmi = lottery_new_arrangement_knobs(distance, error_rate, int(max_iter))
+        cfg_inner.update({
+            "early_termination": True,
+            "flip_phase_iters": [fpi],
+            "flip_mode": ["lottery", "pre"],
+            "pre_max_lambda": LOTTERY_NEW_PRE_MAX_LAMBDA,
+            "pre_max_iter": pmi,
+            "random_machine": "sobol"
+        })
     elif algo == "relay_bp":
         algorithm_val = "relay_bp"
         is_bb = str(code_type).lower() != "surface"
@@ -285,9 +319,15 @@ def worker_task(task_info: tuple, gpu_queue: Queue, dry_run: bool = False):
         )
 
     # 3. 動態生成 decoding.yaml
-    dec_dict = build_decoding_config(algo, max_iter, code_type=code, use_cpu=use_cpu)
+    dec_dict = build_decoding_config(algo, max_iter, code_type=code, use_cpu=use_cpu,
+                                     distance=distance, error_rate=error_rate)
     with open(decoding_yaml_path, "w", encoding="utf-8") as f:
         yaml.dump(dec_dict, f, default_flow_style=False, sort_keys=False)
+
+    if algo == "lottery_bposd_new_arrangement":
+        knobs = dec_dict["decoding"]["config"]
+        print(f"\033[96m[KNOBS]\033[0m {code_tag} d={distance} p={error_rate}: max_iter={max_iter}, "
+              f"fpi={knobs['flip_phase_iters'][0]}, pmi={knobs['pre_max_iter']}, lambda={knobs['pre_max_lambda']}")
 
     if dry_run:
         cmd = [
@@ -389,6 +429,9 @@ def main():
     rates = [float(r.strip()) for r in args.rates.split(",")] if args.rates else DEFAULT_CONFIG["ERROR_RATES"]
     algos = [a.strip() for a in args.algos.split(",")] if args.algos else DEFAULT_CONFIG["BP_ALGOS"]
     surface_dists = [int(d.strip()) for d in args.distances.split(",")] if args.distances else DEFAULT_CONFIG["SURFACE_DISTANCES"]
+
+    if "lottery_bposd_new_arrangement" in algos and any(c.lower() == "surface" for c in codes):
+        sys.exit("lottery_bposd_new_arrangement 只支援 BB code (bb_lottery_pre_setup.md 的 surface 60/40 override 未定義)，請從 --codes 拿掉 surface")
 
     gpus = [g.strip() for g in args.gpus.split(",") if g.strip()]
     if not gpus and not args.cpu:
