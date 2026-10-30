@@ -50,10 +50,10 @@ DEFAULT_CONFIG = {
     #   fpi 與 pmi 依 (d, p, max_iter) 推導 (只支援 BB)
     # - "relay_bp": Relay BP-S (純 BP 多 leg 擾動，不含 OSD，依碼別動態注入參數)
     "BP_ALGOS": [
-        # "bposd",
+        "bposd",
         # "lottery_bposd",
-        "lottery_bposd_new_arrangement"
-        # "relay_bp"
+        "lottery_bposd_new_arrangement",
+        "relay_bp"
     ],
 
     # 雜訊模型: "CIRCUIT_LEVEL" 或 "PHENOMENOLOGICAL"
