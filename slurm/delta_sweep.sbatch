@@ -20,6 +20,8 @@ source "$CONDA_BASE/etc/profile.d/conda.sh"
 conda activate syndrilla
 # compile the CUDA kernels with the env's nvcc (CUDA 13.0, matches torch), not the cudatoolkit module
 export CUDA_HOME=$CONDA_PREFIX
+# the default cudatoolkit module puts its CUDA 13.2 headers on CPATH, which nvcc 13.0 rejects
+unset CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH
 
 cd "$SLURM_SUBMIT_DIR"
 echo "task $SLURM_ARRAY_TASK_ID on $(hostname), CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
