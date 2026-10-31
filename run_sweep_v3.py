@@ -35,13 +35,13 @@ from tools.bb_circuit_generator import (
 # =====================================================================
 DEFAULT_CONFIG = {
     # 支援: "surface", "72", "144", "288", "360"
-    "CODES": ["72", "144", "288", "360"],
+    "CODES": ["288", "360"],
     
     # 針對 Surface code 的 distance 列表 (BB code 會自動依尺寸對應預設 distance)
     "SURFACE_DISTANCES": [3, 9, 15, 21], # 3, 9, 15, 21
     
     # 物理錯誤率掃描列表
-    "ERROR_RATES": [0.01, 0.005, 0.003, 0.001],
+    "ERROR_RATES": [0.01, 0.005, 0.003, 0.001], # 0.01, 0.005, 0.003, 0.001
     
     # 解碼演算法清單:
     # - "bposd": 標準 Normalized Min-Sum + OSD-0
@@ -49,11 +49,15 @@ DEFAULT_CONFIG = {
     # - "lottery_bposd_new_arrangement": 同 lottery_bposd，排程依 bb_lottery_pre_setup.md，
     #   fpi 與 pmi 依 (d, p, max_iter) 推導 (只支援 BB)
     # - "relay_bp": Relay BP-S (純 BP 多 leg 擾動，不含 OSD，依碼別動態注入參數)
+    # - "bp" / "lottery_bp" / "lottery_bp_new_arrangement": 對應 bposd / lottery_bposd / lottery_bposd_new_arrangement
+    #   的 BP 階段，不接 OSD-0；畫圖時併入對應演算法的 Pure BP 曲線
     "BP_ALGOS": [
+        # "bp",
+        # "lottery_bp_new_arrangement"
         "bposd",
         # "lottery_bposd",
-        "lottery_bposd_new_arrangement",
-        "relay_bp"
+        "lottery_bposd_new_arrangement"
+        # "relay_bp"
     ],
 
     # 雜訊模型: "CIRCUIT_LEVEL" 或 "PHENOMENOLOGICAL"
@@ -73,7 +77,8 @@ DEFAULT_CONFIG = {
         0.01: 200,
         0.005: 100,
         0.003: 20,
-        0.001: 10,
+        0.001: 5,
+        0.0001: 10,
         "default": 100
     },
     # MAX_ITER 支援 "auto" (自動依碼長 n 設置: BB 72->72, 144->144, 360->360; Surface->2d(d-1)+1) 或指定整數
@@ -102,6 +107,14 @@ def parse_args():
 
 LOTTERY_NEW_PRE_MAX_LAMBDA = 16
 
+# 純 BP 版本 -> 帶 OSD-0 的對應演算法 (同一個 BP 設定，只拿掉 osd_0 階段)
+PURE_BP_ALGOS = {
+    "bp": "bposd",
+    "lottery_bp": "lottery_bposd",
+    "lottery_bp_new_arrangement": "lottery_bposd_new_arrangement",
+}
+NEW_ARRANGEMENT_ALGOS = ("lottery_bposd_new_arrangement", "lottery_bp_new_arrangement")
+
 def lottery_new_arrangement_knobs(distance: int, rate: float, max_iter: int, pre_max_lambda: int = LOTTERY_NEW_PRE_MAX_LAMBDA) -> tuple:
     """
     bb_lottery_pre_setup.md 的 BB 排程，回傳 (fpi, pmi):
@@ -124,13 +137,16 @@ def build_decoding_config(algo: str, max_iter: int, code_type: str = "144", use_
         "max_iter": int(max_iter)
     }
 
+    pure_bp = algo in PURE_BP_ALGOS
+    algo = PURE_BP_ALGOS.get(algo, algo)
+
     if algo == "bposd":
         algorithm_val = ["bp_norm_min_sum", "osd_0"]
     elif algo == "lottery_bposd":
         algorithm_val = ["bp_lottery", "osd_0"]
     elif algo == "lottery_bposd_new_arrangement":
         if str(code_type).lower() == "surface":
-            raise ValueError("lottery_bposd_new_arrangement 只支援 BB code")
+            raise ValueError("new arrangement 只支援 BB code")
         algorithm_val = ["bp_lottery", "osd_0"]
         fpi, pmi = lottery_new_arrangement_knobs(distance, error_rate, int(max_iter))
         cfg_inner.update({
@@ -157,6 +173,9 @@ def build_decoding_config(algo: str, max_iter: int, code_type: str = "144", use_
         })
     else:
         algorithm_val = algo
+
+    if pure_bp:
+        algorithm_val = algorithm_val[0]
 
     dec_body = {
         "algorithm": algorithm_val,
@@ -326,7 +345,7 @@ def worker_task(task_info: tuple, gpu_queue: Queue, dry_run: bool = False):
     with open(decoding_yaml_path, "w", encoding="utf-8") as f:
         yaml.dump(dec_dict, f, default_flow_style=False, sort_keys=False)
 
-    if algo == "lottery_bposd_new_arrangement":
+    if algo in NEW_ARRANGEMENT_ALGOS:
         knobs = dec_dict["decoding"]["config"]
         print(f"\033[96m[KNOBS]\033[0m {code_tag} d={distance} p={error_rate}: max_iter={max_iter}, "
               f"fpi={knobs['flip_phase_iters'][0]}, pmi={knobs['pre_max_iter']}, lambda={knobs['pre_max_lambda']}")
@@ -432,8 +451,8 @@ def main():
     algos = [a.strip() for a in args.algos.split(",")] if args.algos else DEFAULT_CONFIG["BP_ALGOS"]
     surface_dists = [int(d.strip()) for d in args.distances.split(",")] if args.distances else DEFAULT_CONFIG["SURFACE_DISTANCES"]
 
-    if "lottery_bposd_new_arrangement" in algos and any(c.lower() == "surface" for c in codes):
-        sys.exit("lottery_bposd_new_arrangement 只支援 BB code (bb_lottery_pre_setup.md 的 surface 60/40 override 未定義)，請從 --codes 拿掉 surface")
+    if any(a in NEW_ARRANGEMENT_ALGOS for a in algos) and any(c.lower() == "surface" for c in codes):
+        sys.exit("new arrangement 只支援 BB code (bb_lottery_pre_setup.md 的 surface 60/40 override 未定義)，請從 --codes 拿掉 surface")
 
     gpus = [g.strip() for g in args.gpus.split(",") if g.strip()]
     if not gpus and not args.cpu:

@@ -64,6 +64,16 @@ DECODER_STYLES_PURE_BP = {
     "relay_bp": {"marker": "s", "ls": ":", "label": "Relay BP"},
 }
 
+# 純 BP 演算法 (不接 OSD) 併入對應 BPOSD 演算法的 Pure BP 曲線，同一個 p 以純 BP 的結果為準
+PURE_BP_ALGOS = {
+    "bp": "bposd",
+    "lottery_bp": "lottery_bposd",
+    "lottery_bp_new_arrangement": "lottery_bposd_new_arrangement",
+}
+
+# 純 Lottery BP 對照圖只畫這兩個排法
+LOTTERY_COMPARE_ALGOS = ("lottery_bposd", "lottery_bposd_new_arrangement")
+
 def fast_extract_lers(filepath: str):
     """
     極速串流解析 YAML (單檔 < 0.5ms，避免 yaml.load 反序列化龐大整數陣列導致 CPU 凍結)
@@ -121,6 +131,7 @@ def collect_data(results_dir: str):
     bb_osd = {}
     surface_bp = {}
     bb_bp = {}
+    pure_bp_points = []
 
     if not os.path.exists(results_dir):
         print(f"[WARN] Results directory '{results_dir}' does not exist.")
@@ -170,6 +181,12 @@ def collect_data(results_dir: str):
                 full_path = os.path.join(root, f)
                 ler_osd, ler_bp = fast_extract_lers(full_path)
 
+                # 純 BP 沒有 OSD 結果，只在掃描完後併入 Pure BP 曲線
+                if algo in PURE_BP_ALGOS:
+                    if ler_bp is not None:
+                        pure_bp_points.append((code_tag, dist, PURE_BP_ALGOS[algo], p_err, ler_bp))
+                    continue
+
                 if "surface" in code_tag.lower():
                     dist = dist if dist is not None else 3
                     if ler_osd is not None:
@@ -177,20 +194,32 @@ def collect_data(results_dir: str):
                     if ler_bp is not None:
                         surface_bp.setdefault(dist, {}).setdefault(algo, {})[p_err] = ler_bp
                 else:
-                    schedule = "7layer"
-                    for s in BB_SCHEDULES:
-                        if code_tag.endswith(f"_{s}"):
-                            schedule = s
-                            code_tag = code_tag[:-len(s) - 1]
-                            break
-                    m_bb = re.search(r'(\[\[.+\]\])', code_tag)
-                    clean_code = m_bb.group(1) if m_bb else code_tag
+                    schedule, clean_code = split_bb_tag(code_tag)
                     if ler_osd is not None:
                         bb_osd.setdefault(schedule, {}).setdefault(clean_code, {}).setdefault(algo, {})[p_err] = ler_osd
                     if ler_bp is not None:
                         bb_bp.setdefault(schedule, {}).setdefault(clean_code, {}).setdefault(algo, {})[p_err] = ler_bp
 
+    for code_tag, dist, algo, p_err, ler_bp in pure_bp_points:
+        if "surface" in code_tag.lower():
+            dist = dist if dist is not None else 3
+            surface_bp.setdefault(dist, {}).setdefault(algo, {})[p_err] = ler_bp
+        else:
+            schedule, clean_code = split_bb_tag(code_tag)
+            bb_bp.setdefault(schedule, {}).setdefault(clean_code, {}).setdefault(algo, {})[p_err] = ler_bp
+
     return (surface_osd, bb_osd), (surface_bp, bb_bp)
+
+def split_bb_tag(code_tag: str):
+    """BB 資料夾名稱 BB_<n>_<schedule> -> (schedule, code)，沒有後綴的 BB_<n> 視為 "7layer" """
+    schedule = "7layer"
+    for s in BB_SCHEDULES:
+        if code_tag.endswith(f"_{s}"):
+            schedule = s
+            code_tag = code_tag[:-len(s) - 1]
+            break
+    m_bb = re.search(r'(\[\[.+\]\])', code_tag)
+    return schedule, (m_bb.group(1) if m_bb else code_tag)
 
 def plot_curve(data: dict, is_surface: bool = True, output_path: str = "ler_curve.png", pure_bp: bool = False, title_suffix: str = ""):
     """
@@ -310,6 +339,15 @@ def main():
     for schedule, (file_tag, title_suffix) in bb_variants.items():
         if bb_bp.get(schedule):
             plot_curve(bb_bp[schedule], is_surface=False, output_path=os.path.join(args.output_dir, f"bb_code{file_tag}_pure_bp_ler.png"),
+                       pure_bp=True, title_suffix=title_suffix)
+
+    # 3. 純 Lottery BP 舊排法 vs new arrangement (只放這兩條線)
+    for schedule, (file_tag, title_suffix) in bb_variants.items():
+        lottery_bp = {code: {a: pts for a, pts in algos.items() if a in LOTTERY_COMPARE_ALGOS}
+                      for code, algos in bb_bp.get(schedule, {}).items()}
+        lottery_bp = {code: algos for code, algos in lottery_bp.items() if algos}
+        if lottery_bp:
+            plot_curve(lottery_bp, is_surface=False, output_path=os.path.join(args.output_dir, f"bb_code{file_tag}_lottery_bp_compare_ler.png"),
                        pure_bp=True, title_suffix=title_suffix)
 
 if __name__ == "__main__":
