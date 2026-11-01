@@ -16,8 +16,11 @@
 set -euo pipefail
 
 CONDA_BASE=${CONDA_BASE:-/projects/bebv/cpeng4/miniforge3}
+# the env's activate.d scripts (cuda-nvcc) read unset variables, so activate without -u
+set +u
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 conda activate syndrilla
+set -u
 # compile the CUDA kernels with the env's nvcc (CUDA 13.0, matches torch), not the cudatoolkit module
 export CUDA_HOME=$CONDA_PREFIX
 # the default cudatoolkit module puts its CUDA 13.2 headers on CPATH, which nvcc 13.0 rejects
