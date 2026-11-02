@@ -146,7 +146,8 @@ class create(_RelayPy):
                     break
 
             num_iters += leg_iters.clamp(min=0)
-            valid_mask = (converges == 1) & (solutions < self.solution)
+            # a solution counts only in the leg that found it; converges stays set across legs
+            valid_mask = (leg_iters != -1) & (solutions < self.solution)
             new_e_weight_all = (e_out[:, :-1] * u_init[:, :-1].abs()).sum(dim=1)
             solutions = solutions + valid_mask.to(solutions.dtype)
             improve_mask = valid_mask & (new_e_weight_all < e_solutions)

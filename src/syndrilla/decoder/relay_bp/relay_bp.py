@@ -358,7 +358,8 @@ class create(torch.nn.Module):
                 if checker.size()[0] == indices.size()[0]:
                     break
 
-            valid_mask = (converges == 1) & (solutions < self.solution)
+            # a solution counts only in the leg that found it; converges stays set across legs
+            valid_mask = (num_iters_local != -1) & (solutions < self.solution)
 
             # decoding quality = sum of the prior LLRs over the decoded support
             new_e_weight_all = (e_out[:, :-1] * u_init[:, :-1].abs()).sum(dim=1)
