@@ -4,6 +4,7 @@ import time
 
 import pytest
 import torch
+import yaml
 from loguru import logger
 
 sys.path.append(os.getcwd())
@@ -446,6 +447,29 @@ def quiet_logger():
     logger.remove()
     yield
     logger.add(sys.stderr)
+
+
+def test_interrupted_save_keeps_previous_checkpoint(tmp_path, monkeypatch, quiet_logger):
+    """A save that dies mid-write must leave the last checkpoint loadable, since a batch
+    job can be killed at any moment and the result file is all a resumed run has."""
+    state = MetricState(1, 1, torch.device("cpu"))
+    out = state.get_all_metrics(1, ["bp_norm_min_sum"])
+    out[0]["distribution"] = torch.zeros(4)
+    save_args = (str(tmp_path) + "/", 10, 5, "torch.float64", 0.01, 1, 3, "h", 1)
+
+    state.save_metric(out, *save_args)
+    ckpt_path = tmp_path / "result_phy_err_0.01.yaml"
+    before = ckpt_path.read_text()
+
+    def killed_mid_write(data, stream, **kwargs):
+        stream.write("decoder_0:\n  algor")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(yaml, "safe_dump", killed_mid_write)
+    with pytest.raises(KeyboardInterrupt):
+        state.save_metric(out, *save_args[:6], 4, *save_args[7:])
+
+    assert ckpt_path.read_text() == before
 
 
 def main():

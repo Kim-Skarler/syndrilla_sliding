@@ -863,10 +863,13 @@ class MetricState:
         yaml.SafeDumper.add_representer(float, float_representer)
         yaml.SafeDumper.add_representer(list, list_representer)
 
-        with open(output_path, "w") as f:
+        # this file is also the run's checkpoint: a job killed mid-write must leave the old one intact
+        tmp_path = output_path + ".tmp"
+        with open(tmp_path, "w") as f:
             yaml.safe_dump(
                 all_metrics_results, f, sort_keys=False, default_flow_style=False
             )
+        os.replace(tmp_path, output_path)
 
     @classmethod
     def resume_checkpoint(
