@@ -562,10 +562,13 @@ def generate_surface_interface_yaml(
     error_rate: float,
     rounds: int = None,
     output_yaml_path: str = None,
-    decompose_errors: bool = False
+    decompose_errors: bool = False,
+    before_round_data_depolarization: float = 0.0
 ) -> str:
     """
     Builds Surface code Stim circuit and saves to .interface.yaml
+    The default noise is the Relay-BP paper's: gates, preparation and measurement only.
+    Results from before this default used before_round_data_depolarization=error_rate.
     """
     if rounds is None or rounds <= 0:
         rounds = distance
@@ -577,7 +580,7 @@ def generate_surface_interface_yaml(
         after_clifford_depolarization=error_rate,
         after_reset_flip_probability=error_rate,
         before_measure_flip_probability=error_rate,
-        before_round_data_depolarization=error_rate
+        before_round_data_depolarization=before_round_data_depolarization
     )
 
     data = {

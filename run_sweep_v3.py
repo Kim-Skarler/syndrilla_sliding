@@ -35,10 +35,11 @@ from tools.bb_circuit_generator import (
 # =====================================================================
 DEFAULT_CONFIG = {
     # 支援: "surface", "72", "144", "288", "360"
-    "CODES": ["288", "360"],
+    "CODES": ["360"],
     
     # 針對 Surface code 的 distance 列表 (BB code 會自動依尺寸對應預設 distance)
-    "SURFACE_DISTANCES": [3, 9, 15, 21], # 3, 9, 15, 21
+    # d=11 是 Relay-BP paper 唯一有結果的 surface distance，留著才能和 paper 對照
+    "SURFACE_DISTANCES": [3, 9, 11, 15, 21],
     
     # 物理錯誤率掃描列表
     "ERROR_RATES": [0.01, 0.005, 0.003, 0.001], # 0.01, 0.005, 0.003, 0.001
@@ -56,8 +57,8 @@ DEFAULT_CONFIG = {
         # "lottery_bp_new_arrangement"
         "bposd",
         # "lottery_bposd",
-        "lottery_bposd_new_arrangement"
-        # "relay_bp"
+        "lottery_bposd_new_arrangement",
+        "relay_bp"
     ],
 
     # 雜訊模型: "CIRCUIT_LEVEL" 或 "PHENOMENOLOGICAL"
@@ -68,7 +69,8 @@ DEFAULT_CONFIG = {
     # - "7layer": 參考 Stim generated circuit 的結構與雜訊 (X+Z detectors)，原本的 CNOT 順序
     # - "stim":   同 7layer，但換成 IBM 的 CNOT 順序 (circuit distance 較高)
     # 結果存到 BB_<n>_<schedule>/
-    "BB_SCHEDULE": "7layer",
+    # 預設 "ibm" 對應 Relay-BP paper: Bravyi et al. 的線路，X detectors 即 paper 預設的 XZ 解碼
+    "BB_SCHEDULE": "ibm",
 
     # 預設執行參數
     "BATCH_SIZE": 2500,
@@ -83,7 +85,8 @@ DEFAULT_CONFIG = {
     },
     # MAX_ITER 支援 "auto" (自動依碼長 n 設置: BB 72->72, 144->144, 360->360; Surface->2d(d-1)+1) 或指定整數
     "MAX_ITER": "auto",
-    "BASE_RESULT_DIR": "results"
+    # paper 設置的線路和雜訊與舊數據不同，分開存；接續舊的 7layer 點要加 --bb-schedule 7layer -r results
+    "BASE_RESULT_DIR": "results_paper"
 }
 
 def parse_args():
@@ -103,9 +106,30 @@ def parse_args():
     parser.add_argument("--count-tasks", action="store_true", help="Print the number of experiment points and exit (for Slurm --array sizing)")
     parser.add_argument("--task-index", type=int, default=None, help="Run only the experiment point at this index (Slurm array task)")
     parser.add_argument("-r", "--result-dir", type=str, default=DEFAULT_CONFIG["BASE_RESULT_DIR"], help="Output results directory")
+    parser.add_argument("--relay-interval", type=str, default=None, help="relay_bp memory strength interval 'low,high', replaces the per-code value (e.g. '-0.24,0.66')")
+    parser.add_argument("--relay-solution", type=int, default=None, help="relay_bp solutions to collect, replaces the default 5")
+    parser.add_argument("--relay-legs", type=int, default=None, help="relay_bp max legs, replaces the default 601")
     return parser.parse_args()
 
 LOTTERY_NEW_PRE_MAX_LAMBDA = 16
+
+# Relay-BP paper (arXiv:2506.01779) 的 (第一個 leg 的 gamma, center, width)，center/width 由 paper 的區間換算:
+# 144: [-0.24, 0.66]，288: [-0.161, 0.815]，surface (只有 d=11): [-0.254, 0.985]
+RELAY_PAPER_PARAMS = {
+    "144": (0.125, 0.21, 0.90),
+    "288": (0.125, 0.327, 0.976),
+    "surface": (0.35, 0.3655, 1.239),
+}
+
+# --relay-interval / --relay-solution / --relay-legs 的覆寫值，比較不同設定時才會用到；結果請存到另一個 -r 資料夾
+RELAY_OVERRIDES = {}
+
+def relay_paper_params(code_type: str) -> tuple:
+    """paper 有列的碼直接查表；沒列的 BB code (72、360 等) 借碼長最接近的 BB code"""
+    if str(code_type).lower() == "surface":
+        return RELAY_PAPER_PARAMS["surface"]
+    n = resolve_code_n(code_type)
+    return RELAY_PAPER_PARAMS[str(min((144, 288), key=lambda listed: abs(listed - n)))]
 
 # 純 BP 版本 -> 帶 OSD-0 的對應演算法 (同一個 BP 設定，只拿掉 osd_0 階段)
 PURE_BP_ALGOS = {
@@ -159,18 +183,19 @@ def build_decoding_config(algo: str, max_iter: int, code_type: str = "144", use_
         })
     elif algo == "relay_bp":
         algorithm_val = "relay_bp"
-        is_bb = str(code_type).lower() != "surface"
+        gamma0, center, width = relay_paper_params(code_type)
+        # Relay-BP-5: paper 的 check update 沒有 scaling，所以 alpha 固定 1.0
         cfg_inner.update({
             "legs": 601,
             "iteration_initial": 80,
             "iteration_count": 60,
             "solution": 5,
-            "init_mem_strength": 0.125 if is_bb else 0.35,
-            "center": 0.21 if is_bb else 0.3655,
-            "width": 0.90 if is_bb else 1.239,
-            "alpha": 0.0,
-            "alpha_scaling": 1.0
+            "init_mem_strength": gamma0,
+            "center": center,
+            "width": width,
+            "alpha": 1.0
         })
+        cfg_inner.update(RELAY_OVERRIDES)
     else:
         algorithm_val = algo
 
@@ -187,6 +212,9 @@ def build_decoding_config(algo: str, max_iter: int, code_type: str = "144", use_
         },
         "config": cfg_inner
     }
+    if algo == "relay_bp":
+        # paper 沒有 rebatch 的 iteration cap
+        dec_body["rebatch_opt"] = False
 
     # 同時提供 decoding 與 decoder，100% 雙向相容新舊版 Syndrilla
     cfg = {
@@ -450,6 +478,14 @@ def main():
     rates = [float(r.strip()) for r in args.rates.split(",")] if args.rates else DEFAULT_CONFIG["ERROR_RATES"]
     algos = [a.strip() for a in args.algos.split(",")] if args.algos else DEFAULT_CONFIG["BP_ALGOS"]
     surface_dists = [int(d.strip()) for d in args.distances.split(",")] if args.distances else DEFAULT_CONFIG["SURFACE_DISTANCES"]
+
+    if args.relay_interval:
+        low, high = (float(x) for x in args.relay_interval.split(","))
+        RELAY_OVERRIDES.update(center=(low + high) / 2, width=high - low)
+    if args.relay_solution is not None:
+        RELAY_OVERRIDES["solution"] = args.relay_solution
+    if args.relay_legs is not None:
+        RELAY_OVERRIDES["legs"] = args.relay_legs
 
     if any(a in NEW_ARRANGEMENT_ALGOS for a in algos) and any(c.lower() == "surface" for c in codes):
         sys.exit("new arrangement 只支援 BB code (bb_lottery_pre_setup.md 的 surface 60/40 override 未定義)，請從 --codes 拿掉 surface")
