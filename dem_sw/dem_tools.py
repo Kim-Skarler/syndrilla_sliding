@@ -63,7 +63,7 @@ def build_dem(code: str = "144", p: float = 0.003, rounds: int = None, schedule:
     rounds = rounds if rounds else dist
     ell, m = BB_CODE_DICT[bb_key][:2]
     circuit = build_circuit(code, p, rounds, schedule)
-    dem = circuit.detector_error_model(decompose_errors=False)
+    dem = circuit.detector_error_model(decompose_errors=False, flatten_loops=True)
 
     coords = circuit.get_detector_coordinates()
     num_det = circuit.num_detectors

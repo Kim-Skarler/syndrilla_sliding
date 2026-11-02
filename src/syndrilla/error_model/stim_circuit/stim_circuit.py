@@ -19,9 +19,9 @@ _MIN_RATE = 1e-9
 _MAX_RATE = 0.5
 
 
-def _dem_of(circuit):
+def _dem_of(circuit, flatten_loops=True):
     """The undecomposed DEM, matching how `matrix/stim` builds `H`."""
-    return circuit.detector_error_model(decompose_errors=False)
+    return circuit.detector_error_model(decompose_errors=False, flatten_loops=flatten_loops)
 
 
 def _error_priors(dem):
@@ -54,6 +54,9 @@ class create:
         self.decompose = error_model_cfg.get("decompose_errors", False)
         if not isinstance(self.decompose, bool):
             raise ValueError("decompose_errors must be a bool.")
+        self.flatten_loops = error_model_cfg.get("flatten_loops", True)
+        if not isinstance(self.flatten_loops, bool):
+            raise ValueError("flatten_loops must be a bool.")
         circuit_str = error_model_cfg.get("circuit", None)
         circuit = get_stim_circuit(circuit_str=circuit_str)
 
@@ -78,7 +81,7 @@ class create:
                 j for indices in self._mechanism_components for j in indices
             ], dtype=torch.long)
         else:
-            self.dem = _dem_of(circuit)
+            self.dem = _dem_of(circuit, self.flatten_loops)
             priors = _error_priors(self.dem)
         self.num_errors = len(priors)
         self.priors = torch.tensor(priors, dtype=torch.float64)
@@ -176,7 +179,7 @@ class create:
                 table.append(data["priors"].tolist())
                 mechanism_table.append(data["mechanism_priors"].tolist())
             else:
-                dem = _dem_of(circuit)
+                dem = _dem_of(circuit, self.flatten_loops)
                 same_supports = _error_supports(dem) == self._supports
                 table.append(_error_priors(dem))
             if not same_supports:

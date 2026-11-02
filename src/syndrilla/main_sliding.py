@@ -62,7 +62,7 @@ class Dem:
 
     def __init__(self, circuit):
         self.circuit = circuit
-        self.dem = circuit.detector_error_model(decompose_errors=False)
+        self.dem = circuit.detector_error_model(decompose_errors=False, flatten_loops=True)
         coords = circuit.get_detector_coordinates()
         num_det = circuit.num_detectors
         if any(not coords.get(i) for i in range(num_det)):

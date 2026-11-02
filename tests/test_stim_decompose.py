@@ -219,6 +219,52 @@ def test_decompose_requires_bool(flag):
             build()
 
 
+@pytest.mark.parametrize("flag", [0, 1, "false", None])
+def test_flatten_loops_requires_bool(flag):
+    circuit, _ = _generated()
+    for build in (
+        lambda: matrix_stim._build_dem_matrices(circuit, flatten_loops=flag),
+        lambda: matrix_stim.create(dict(circuit=str(circuit), flatten_loops=flag), device=torch.device("cpu")),
+        lambda: error_stim.create(dict(circuit=str(circuit), flatten_loops=flag)),
+        lambda: syndrome_stim.create(dict(circuit=str(circuit), flatten_loops=flag)),
+        lambda: create_interface(cfg=dict(backend="stim", circuit=str(circuit), flatten_loops=flag)),
+    ):
+        with pytest.raises(ValueError, match="flatten_loops"):
+            build()
+
+
+def _columns(h, logical):
+    h, logical = h.tocsc(), logical.tocsc()
+    return [(tuple(h[:, j].indices.tolist()), tuple(logical[:, j].indices.tolist())) for j in range(h.shape[1])]
+
+
+def test_flatten_loops_xor_merges_the_duplicates_of_a_folded_dem():
+    # d = 3 and 5 are too short for stim to fold a repeat block, so they have no duplicates to merge
+    circuit, _ = _generated(distance=7, rate=0.005)
+    h, logical, priors = matrix_stim._build_dem_matrices(circuit)
+    folded_h, folded_logical, folded_priors = matrix_stim._build_dem_matrices(circuit, flatten_loops=False)
+    assert h.shape[1] < folded_h.shape[1]
+
+    merged = {}
+    for key, q in zip(_columns(folded_h, folded_logical), folded_priors):
+        p = merged.get(key, 0.0)
+        merged[key] = p * (1 - q) + (1 - p) * q
+    flat = _columns(h, logical)
+    assert len(set(flat)) == len(flat)
+    assert set(flat) == set(merged)
+    np.testing.assert_allclose(priors, [merged[key] for key in flat], rtol=1e-12)
+
+
+def test_flatten_loops_reaches_every_part_of_the_interface():
+    circuit, _ = _generated(distance=7, rate=0.005)
+    for flag in (True, False):
+        interface = create_interface(cfg=dict(backend="stim", circuit=str(circuit), flatten_loops=flag))
+        num_columns = matrix_stim._build_dem_matrices(circuit, flatten_loops=flag)[0].shape[1]
+        assert interface.error_model.num_errors == num_columns
+        assert interface.syndrome_generator._H.shape[1] == num_columns
+        assert interface.matrix_bundle.select("hx")[3].shape[1] == num_columns
+
+
 def test_undecomposable_mechanism_is_rejected():
     circuit = stim.Circuit("""
         R 0 1 2

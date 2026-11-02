@@ -81,21 +81,28 @@ def _build_decomposed_dem(circuit):
     return result
 
 
-def _build_dem_matrices(circuit, decompose=False):
+def _build_dem_matrices(circuit, decompose=False, flatten_loops=True):
     """Extract (H, obs_mat, priors) from a stim circuit, H and obs_mat as scipy CSR.
-    Cached by circuit content (string form) and decomposition flag, since id() can be recycled by CPython when a Circuit is freed,
+    Cached by circuit content (string form) and both flags, since id() can be recycled by CPython when a Circuit is freed,
     causing a fresh Circuit to alias an unrelated cached entry.
+
+    A DEM folded into a repeat block lists a fault inside and outside the block separately, and
+    dem.flattened() does not merge them, so with flatten_loops=False H holds duplicate columns that
+    split one fault's prior and stop BP from converging on large circuits. False only reproduces
+    results from before this default; the decomposed path merges its components either way.
     """
     if not isinstance(decompose, bool):
         raise ValueError("decompose_errors must be a bool.")
+    if not isinstance(flatten_loops, bool):
+        raise ValueError("flatten_loops must be a bool.")
     if decompose:
         data = _build_decomposed_dem(circuit)
         return data["H"], data["obs_mat"], data["priors"]
-    key = (str(circuit), False)
+    key = (str(circuit), False, flatten_loops)
     if key in STIM_CIRCUIT_CACHE:
         return STIM_CIRCUIT_CACHE[key]
 
-    dem = circuit.detector_error_model(decompose_errors=False)
+    dem = circuit.detector_error_model(decompose_errors=False, flatten_loops=flatten_loops)
     num_detectors = dem.num_detectors
     num_observables = dem.num_observables
 
@@ -153,7 +160,9 @@ class create:
                 f"stim matrix loader 'target' must be 'check' or 'observable', got <{self.target}>."
             )
 
-        H, obs_mat, priors = _build_dem_matrices(circuit, matrix_cfg.get("decompose_errors", False))
+        H, obs_mat, priors = _build_dem_matrices(
+            circuit, matrix_cfg.get("decompose_errors", False), matrix_cfg.get("flatten_loops", True)
+        )
         self._matrix = H if self.target == "check" else obs_mat
         self.priors = priors
 

@@ -80,6 +80,9 @@ class create:
         decompose = interface_cfg.get("decompose_errors", False)
         if not isinstance(decompose, bool):
             raise ValueError("decompose_errors must be a bool.")
+        flatten_loops = interface_cfg.get("flatten_loops", True)
+        if not isinstance(flatten_loops, bool):
+            raise ValueError("flatten_loops must be a bool.")
         circuit_inline = interface_cfg.get("circuit", None)
 
         circuit_gen_cfg = None
@@ -128,7 +131,11 @@ class create:
             f"Stim interface: channels={number_channel}, device={device}, dtype={dtype}"
         )
 
-        circuit_ref = {"circuit": str(self.circuit), "decompose_errors": decompose}
+        circuit_ref = {
+            "circuit": str(self.circuit),
+            "decompose_errors": decompose,
+            "flatten_loops": flatten_loops,
+        }
 
         em_cfg = {
             "model": "stim_circuit",
