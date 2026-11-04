@@ -39,7 +39,7 @@ DEFAULT_CONFIG = {
     
     # 針對 Surface code 的 distance 列表 (BB code 會自動依尺寸對應預設 distance)
     # d=11 是 Relay-BP paper 唯一有結果的 surface distance，留著才能和 paper 對照
-    "SURFACE_DISTANCES": [3, 9, 11, 15, 21],
+    "SURFACE_DISTANCES": [3, 9, 15, 21],
     
     # 物理錯誤率掃描列表
     "ERROR_RATES": [0.01, 0.005, 0.003, 0.001], # 0.01, 0.005, 0.003, 0.001
@@ -66,11 +66,18 @@ DEFAULT_CONFIG = {
 
     # BB 電路排程:
     # - "ibm":    與 IBM decoder_setup.py 相同的 depth-8 cycle 與雜訊模型，只宣告 X detectors
+    # - "ibm_xyz": 同 ibm，但宣告 X+Z detectors
     # - "7layer": 參考 Stim generated circuit 的結構與雜訊 (X+Z detectors)，原本的 CNOT 順序
     # - "stim":   同 7layer，但換成 IBM 的 CNOT 順序 (circuit distance 較高)
     # 結果存到 BB_<n>_<schedule>/
-    # 預設 "ibm" 對應 Relay-BP paper: Bravyi et al. 的線路，X detectors 即 paper 預設的 XZ 解碼
-    "BB_SCHEDULE": "ibm",
+    # relay_bp 要對 Relay-BP paper 的 XYZ 解碼 (Fig 2 的 XYZ-Relay-BP-5)，其他 decoder 接續現有的 7layer 數據
+    # "ibm" 對應 paper 的 XZ 解碼；--bb-schedule 會覆蓋這裡，對所有 decoder 生效
+    "BB_SCHEDULE": {"relay_bp": "ibm_xyz", "default": "7layer"},
+
+    # Surface 雜訊 (同樣依 decoder):
+    # - "uniform_circuit": Relay-BP paper 的 reference circuits，結果存到 surface_uniform_circuit/
+    # - "stim_generated":  Stim generated noise，現有 bposd / lottery 數據用的雜訊，結果存到 surface/
+    "SURFACE_NOISE": {"relay_bp": "uniform_circuit", "default": "stim_generated"},
 
     # 預設執行參數
     "BATCH_SIZE": 2500,
@@ -85,9 +92,13 @@ DEFAULT_CONFIG = {
     },
     # MAX_ITER 支援 "auto" (自動依碼長 n 設置: BB 72->72, 144->144, 360->360; Surface->2d(d-1)+1) 或指定整數
     "MAX_ITER": "auto",
-    # paper 設置的線路和雜訊與舊數據不同，分開存；接續舊的 7layer 點要加 --bb-schedule 7layer -r results
-    "BASE_RESULT_DIR": "results_paper"
+    # paper 設置的線路和雜訊與舊數據不同，分開存；-r 會覆蓋這裡，對所有 decoder 生效
+    "BASE_RESULT_DIR": {"relay_bp": "results_xyz", "default": "results"}
 }
+
+def setting_for_algo(setting: dict, algo: str) -> str:
+    """BB_SCHEDULE / SURFACE_NOISE / BASE_RESULT_DIR 依 decoder 的值"""
+    return setting.get(algo, setting["default"])
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Distributed Sweep Runner for Syndrilla v3")
@@ -100,12 +111,13 @@ def parse_args():
     parser.add_argument("-bs", "--batch-size", type=int, default=DEFAULT_CONFIG["BATCH_SIZE"], help="Batch size per step")
     parser.add_argument("-te", "--target-error", type=str, default=None, help="Target logical error count (e.g. '100' or '0.01:500,0.005:200,default:50')")
     parser.add_argument("--max-iter", type=str, default=str(DEFAULT_CONFIG["MAX_ITER"]), help="Max BP iterations (default: 'auto' to use code length n, or specify an integer)")
-    parser.add_argument("--bb-schedule", type=str, default=DEFAULT_CONFIG["BB_SCHEDULE"], choices=["ibm", "7layer", "stim"], help=f"BB circuit schedule and noise model (default: {DEFAULT_CONFIG['BB_SCHEDULE']})")
+    parser.add_argument("--bb-schedule", type=str, default=None, choices=["ibm", "ibm_xyz", "7layer", "stim"], help=f"BB circuit schedule and noise model for every algo (default per algo: {DEFAULT_CONFIG['BB_SCHEDULE']})")
+    parser.add_argument("--save-interval", type=int, default=None, help="Batches between result saves, at least 10 (default: syndrilla's own, 100). Slow points lose less at the walltime with a small value")
     parser.add_argument("--cpu", action="store_true", help="Force CPU execution")
     parser.add_argument("--dry-run", action="store_true", help="Print experiment points without running")
     parser.add_argument("--count-tasks", action="store_true", help="Print the number of experiment points and exit (for Slurm --array sizing)")
     parser.add_argument("--task-index", type=int, default=None, help="Run only the experiment point at this index (Slurm array task)")
-    parser.add_argument("-r", "--result-dir", type=str, default=DEFAULT_CONFIG["BASE_RESULT_DIR"], help="Output results directory")
+    parser.add_argument("-r", "--result-dir", type=str, default=None, help=f"Output results directory for every algo (default per algo: {DEFAULT_CONFIG['BASE_RESULT_DIR']})")
     parser.add_argument("--relay-interval", type=str, default=None, help="relay_bp memory strength interval 'low,high', replaces the per-code value (e.g. '-0.24,0.66')")
     parser.add_argument("--relay-solution", type=int, default=None, help="relay_bp solutions to collect, replaces the default 5")
     parser.add_argument("--relay-legs", type=int, default=None, help="relay_bp max legs, replaces the default 601")
@@ -333,11 +345,13 @@ def is_point_finished(point_dir: str, target_error: int) -> bool:
     return False
 
 def worker_task(task_info: tuple, gpu_queue: Queue, dry_run: bool = False):
-    code, distance, error_rate, algo, batch_size, target_error, max_iter, base_dir, use_cpu, bb_schedule = task_info
+    code, distance, error_rate, algo, batch_size, target_error, max_iter, base_dir, use_cpu, bb_schedule, surface_noise, save_interval = task_info
 
     code_tag = f"BB_{code}" if str(code).isdigit() else str(code).replace("[", "").replace("]", "").replace(",", "_")
     if code.lower() != "surface":
         code_tag += f"_{bb_schedule}"
+    elif surface_noise != "stim_generated":
+        code_tag += f"_{surface_noise}"
     point_dir = os.path.join(base_dir, code_tag, f"d_{distance}", algo, f"p_{error_rate}")
     
     # 1. 斷點略過檢查
@@ -355,7 +369,8 @@ def worker_task(task_info: tuple, gpu_queue: Queue, dry_run: bool = False):
             distance=distance,
             error_rate=error_rate,
             rounds=distance,
-            output_yaml_path=interface_yaml_path
+            output_yaml_path=interface_yaml_path,
+            noise=surface_noise
         )
     else:
         generate_bb_interface_yaml(
@@ -402,20 +417,14 @@ def worker_task(task_info: tuple, gpu_queue: Queue, dry_run: bool = False):
         oom_shrunk = False
 
         while True:
-            # syndrilla 接續時要求 batch size 與 checkpoint 相同:
-            # - 一般重啟: 改用 checkpoint 的 batch size 接續
-            # - OOM 減半後: 無法用較小的 batch 接續，把舊結果備份成 .bak 後從頭跑這個點
+            # checkpoint 的 batch size 與目前不同時:
+            # - 一般重啟: 改用 checkpoint 的 batch size 接續，不用重新經歷 OOM
+            # - OOM 減半後: 用較小的 batch 接續，累積的 shots 和錯誤數都保留
             existing_ckpt = get_existing_result_file(point_dir)
             ckpt_bs = get_checkpoint_field(existing_ckpt, "batch size") if existing_ckpt else None
-            if ckpt_bs and ckpt_bs != current_bs:
-                if not oom_shrunk:
-                    print(f"\033[96m[RESUME]\033[0m {code_tag} d={distance} {algo} p={error_rate}: 沿用 checkpoint 的 bs={ckpt_bs} (設定為 {current_bs})")
-                    current_bs = ckpt_bs
-                else:
-                    backup = f"{existing_ckpt}.bs{ckpt_bs}.bak"
-                    os.replace(existing_ckpt, backup)
-                    print(f"\033[93m[RESTART]\033[0m {code_tag} d={distance} {algo} p={error_rate}: bs={current_bs} 無法接續 bs={ckpt_bs} 的 checkpoint，舊結果備份為 {os.path.basename(backup)}，從頭跑")
-                    existing_ckpt = None
+            if ckpt_bs and ckpt_bs != current_bs and not oom_shrunk:
+                print(f"\033[96m[RESUME]\033[0m {code_tag} d={distance} {algo} p={error_rate}: 沿用 checkpoint 的 bs={ckpt_bs} (設定為 {current_bs})")
+                current_bs = ckpt_bs
 
             cmd = [
                 sys.executable, "-m", "syndrilla.main",
@@ -425,6 +434,8 @@ def worker_task(task_info: tuple, gpu_queue: Queue, dry_run: bool = False):
                 f"-bs={current_bs}",
                 f"-te={target_error}"
             ]
+            if save_interval is not None:
+                cmd.append(f"--save-interval={save_interval}")
 
             # 斷點接續: 如果已有未達標的結果檔案，傳入 -ckpt 進行接續累積 (修復原先誤用 -c 的 Bug)
             if existing_ckpt:
@@ -433,6 +444,9 @@ def worker_task(task_info: tuple, gpu_queue: Queue, dry_run: bool = False):
                     print(f"\033[96m[RESUME]\033[0m {code_tag} d={distance} {algo} p={error_rate}: target error {ckpt_te} -> {target_error}，接續累積")
                     set_checkpoint_target_error(existing_ckpt, target_error)
                 cmd.append(f"-ckpt={existing_ckpt}")
+                if ckpt_bs != current_bs:
+                    print(f"\033[96m[RESUME]\033[0m {code_tag} d={distance} {algo} p={error_rate}: 從 bs={ckpt_bs} 的 checkpoint 改用 bs={current_bs} 接續")
+                    cmd.append("--allow-batch-size-change")
 
             print(f"\033[92m[START]\033[0m [{gpu_str}] {code_tag} d={distance} {algo} p={error_rate} (bs={current_bs}) -> {point_dir}")
 
@@ -511,7 +525,9 @@ def main():
             tasks.append((
                 code, dist, rate, algo,
                 args.batch_size, pt_target_error, pt_max_iter,
-                args.result_dir, args.cpu, args.bb_schedule
+                args.result_dir or setting_for_algo(DEFAULT_CONFIG["BASE_RESULT_DIR"], algo), args.cpu,
+                args.bb_schedule or setting_for_algo(DEFAULT_CONFIG["BB_SCHEDULE"], algo),
+                setting_for_algo(DEFAULT_CONFIG["SURFACE_NOISE"], algo), args.save_interval
             ))
 
     if args.count_tasks:
@@ -528,7 +544,7 @@ def main():
     print(f"  Codes:        {codes}")
     print(f"  Error Rates:  {rates}")
     print(f"  Algorithms:   {algos}")
-    print(f"  BB schedule:  {args.bb_schedule}")
+    print(f"  BB schedule:  {args.bb_schedule or DEFAULT_CONFIG['BB_SCHEDULE']}")
     print(f"  GPUs:         {gpus} (workers/gpu: {args.workers_per_gpu})")
     print(f"  Batch size:   {args.batch_size}, Target error config: {te_setting}, Max iter config: {args.max_iter}")
     print("=" * 70)

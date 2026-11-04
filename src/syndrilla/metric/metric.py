@@ -884,6 +884,7 @@ class MetricState:
         error_rate,
         H_file_name,
         target_batch=None,
+        allow_batch_size_change=False,
     ):
         """Build this run's decode state, resuming from `checkpoint` if one was given."""
         if checkpoint is None:
@@ -900,6 +901,7 @@ class MetricState:
             error_rate,
             H_file_name,
             target_batch,
+            allow_batch_size_change,
         )
         return metrics, ckpt_meta["num_err"], ckpt_meta["batch_count"]
 
@@ -1031,10 +1033,12 @@ class MetricState:
         physical_error_rate,
         H_file_name,
         target_batch=None,
+        allow_batch_size_change=False,
     ):
-        """Validate checkpoint metadata matches current run parameters."""
+        """Validate checkpoint metadata matches current run parameters.
+        The per-sample accumulators are weighted by sample count, so a new batch size keeps them
+        correct; the yaml's sample count stays exact while batch count x batch size no longer does."""
         checks = [
-            ("batch_size", ckpt_meta["batch_size"], batch_size),
             ("target_error", ckpt_meta["target_error"], target_error),
             ("target_batch", ckpt_meta["target_batch"], target_batch),
             ("dtype", ckpt_meta["dtype"], str(dtype)),
@@ -1045,6 +1049,8 @@ class MetricState:
             ),
             ("H_file_name", ckpt_meta["H_file_name"], H_file_name),
         ]
+        if not allow_batch_size_change:
+            checks.insert(0, ("batch_size", ckpt_meta["batch_size"], batch_size))
         for name, ckpt_val, input_val in checks:
             if ckpt_val != input_val:
                 raise FileNotFoundError(

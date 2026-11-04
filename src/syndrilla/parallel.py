@@ -327,7 +327,7 @@ def add_run_flags(parser):
         "--save-interval",
         type=int,
         default=None,
-        help="Batches between a worker's result saves, at least 100, passed to every worker when given. "
+        help="Batches between a worker's result saves, at least 10, passed to every worker when given. "
         "Default the worker's own, 100.",
     )
     parser.add_argument(
@@ -442,8 +442,8 @@ def parse_args():
     for flags, why in REFUSED:
         if getattr(args, flags[1][2:]) is not None:
             sys.exit(f"{' / '.join(flags)} is not supported by this launcher: {why}")
-    if args.save_interval is not None and args.save_interval < 100:
-        parser.error(f"--save-interval must be at least 100, got {args.save_interval}")
+    if args.save_interval is not None and args.save_interval < 10:
+        parser.error(f"--save-interval must be at least 10, got {args.save_interval}")
     if args.target_error is None and args.target_batch is None:
         args.target_error = 1000
     # With both targets, the stop is pooled and every worker gets the full -tb,

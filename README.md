@@ -109,7 +109,8 @@ Following is a table for detailed explaination on each command line arguments:
 | `-t`     | Train the decoder instead of decoding        | `-t`                                              |
 | `-tr`    | Path to training YAML file                   | `-tr=examples/alist/train_saq_hx.training.yaml`   |
 | `-tckpt` | Path to a run's `*_last.pt`, to resume training; given alongside the same run's `-ckpt` | `-tckpt=tests/test_outputs/saq_hx_n41_last.pt` |
-| `--save-interval` | Batches between result saves, at least `100`, default `100` | `--save-interval=100` |
+| `--save-interval` | Batches between result saves, at least `10`, default `100` | `--save-interval=100` |
+| `--allow-batch-size-change` | With `-ckpt`, resume at a `-bs` different from the checkpoint's; the result YAML's `sample count` stays exact; refused with `-tb` | `--allow-batch-size-change` |
 | `--seed` | Seed for decoding, so the same seed and flags draw the same shots; recorded as `seed` in the result YAML; default unseeded; with `-ckpt` the run seeds with a mixed seed derived from the base seed and the checkpoint's `batch count`, so it draws new shots on CPU and CUDA, using the checkpoint's `seed` when `--seed` is not given; ignored with `-t` | `--seed=0` |
 
 To decode on several GPUs at once, ```syndrilla-parallel``` has three subcommands, and a call without one prints them: ```run``` (one launch, below), ```sweep-gen``` and ```sweep``` (see [Sweep configurations](#5-sweep-configurations)). ```syndrilla-parallel run``` runs one or more ```syndrilla``` processes (workers) per GPU and passes every flag it does not define, except ```-ckpt``` and the training flags, to each worker unchanged. Workers form one flat list: worker i writes to ```<-r>/w<i>/``` and runs on one device, taken from ```--gpus``` repeated ```--workers-per-gpu``` times each in GPU order (with ```--gpus 0 1 --workers-per-gpu 2```, w0 and w1 run on GPU 0, w2 and w3 on GPU 1). ```launch.yaml``` records each worker's name and physical device, and ```merged_result.yaml``` repeats them per worker. The decoding YAML should set ```device_type: cuda``` with ```device_idx: 0```; with ```device_type: cpu```, the launch runs as one worker ```w0``` on ```cpu``` with no ```CUDA_VISIBLE_DEVICES``` set, the probe included, and ```--gpus``` and ```--workers-per-gpu``` are ignored with a note. A run directory from the old ```gpu<g>_w<j>``` or ```cpu_w0``` layout is refused; use a new ```-r```:
@@ -125,7 +126,7 @@ syndrilla-parallel run --gpus 0 1 -r=tests/test_outputs/multi -te=1000 -d=... -i
 | `--workers-per-gpu` | `run`, `sweep` | Workers per GPU, default `1` |
 | `-te`    | `run`, `sweep` | Pooled number of logical errors to stop at, split over workers when given alone; default `1000` unless `-tb` is given |
 | `-tb`    | `run`, `sweep` | Pooled number of batches to stop at, split over workers when given alone; with `-te`, the run stops at whichever is reached first |
-| `--save-interval` | `run`, `sweep` | Batches between a worker's result saves, at least `100`, passed to every worker when given; default the worker's own, `100` |
+| `--save-interval` | `run`, `sweep` | Batches between a worker's result saves, at least `10`, passed to every worker when given; default the worker's own, `100` |
 | `--poll-interval` | `run`, `sweep` | Seconds between reads of the worker result YAMLs; default `60` |
 | `--seed` | `run`, `sweep` | Base seed; in `run`, worker i gets `--seed=<seed+i>`; in `sweep`, see below; default unseeded |
 | `--no-probe` | `run`, `sweep` | Skip the probe decode run |

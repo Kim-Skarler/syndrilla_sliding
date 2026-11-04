@@ -143,7 +143,12 @@ def parse_commandline_args():
         "--save-interval",
         type=int,
         default=100,
-        help="Batches between result saves, at least 100. Default 100.",
+        help="Batches between result saves, at least 10. Default 100.",
+    )
+    parser.add_argument(
+        "--allow-batch-size-change",
+        action="store_true",
+        help="With -ckpt, resume at a -bs different from the checkpoint's, for example after running out of memory. Refused with -tb, which counts batches.",
     )
     parser.add_argument(
         "--seed",
@@ -160,8 +165,10 @@ def parse_commandline_args():
     )
 
     args = parser.parse_args()
-    if args.save_interval < 100:
-        parser.error(f"--save-interval must be at least 100, got {args.save_interval}")
+    if args.save_interval < 10:
+        parser.error(f"--save-interval must be at least 10, got {args.save_interval}")
+    if args.allow_batch_size_change and args.target_batch is not None:
+        parser.error("--allow-batch-size-change cannot be combined with -tb, which counts batches.")
     return args
 
 
@@ -409,6 +416,7 @@ def _main(in_main_thread):
             error_model.rate,
             H_file_name,
             args.target_batch,
+            args.allow_batch_size_change,
         )
 
     queue = ExtraQueue(

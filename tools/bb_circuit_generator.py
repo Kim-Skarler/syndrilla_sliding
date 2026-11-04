@@ -517,14 +517,15 @@ def generate_bb_interface_yaml(
             Hx_matrix=Hx, logical_x_matrix=Lx, rounds=rounds,
             p_data=error_rate, p_meas=error_rate
         )
-    elif schedule in ("ibm", "7layer", "7layer_x", "stim") and bb_key in BB_CODE_DICT:
+    elif schedule in ("ibm", "ibm_xyz", "7layer", "7layer_x", "stim") and bb_key in BB_CODE_DICT:
         ell, m_val, a1, a2, a3, b1, b2, b3 = BB_CODE_DICT[bb_key]
         matchings = get_bb_matchings(ell, m_val, a1, a2, a3, b1, b2, b3)
         num_data = 2 * ell * m_val
         num_checks = ell * m_val
-        if schedule == "ibm":
+        if schedule in ("ibm", "ibm_xyz"):
+            # "ibm_xyz": the same circuit with X+Z detectors, the Relay-BP paper's XYZ decoding
             circuit = _build_ibm_bb_circuit(matchings, num_data, num_checks, Lx, rounds, error_rate,
-                                            z_detectors=z_detectors)
+                                            z_detectors=z_detectors or schedule == "ibm_xyz")
         else:
             # "7layer": Stim generated-circuit conventions with the original CNOT order;
             # "7layer_x": the same circuit with X-check detectors only (binary Z-error decoding);
@@ -557,31 +558,94 @@ def generate_bb_interface_yaml(
 
     return str(circuit)
 
+def _insert_uniform_circuit_noise(
+    circuit: stim.Circuit,
+    p: float,
+    data_qubits: list = None,
+    in_repeat: bool = False
+) -> stim.Circuit:
+    """
+    Uniform circuit noise of the Relay-BP reference circuits, for the gates of Stim's surface code circuits.
+    Altered from insert_uniform_academic_circuit_noise in relay_bp/stim/noise.py,
+    (C) Copyright IBM 2025, Apache License 2.0.
+    - CX: DEPOLARIZE2(p); reset: flip p; H: noiseless; idle in a tick with a noisy operation: DEPOLARIZE1(p)
+    - MR: outcome flip p, without a reset flip
+    - outside the repeat block, a qubit measured once counts as a data qubit and reads out noiselessly;
+      with a folded circuit this also covers the ancillas of the first round, as in the reference circuits
+    """
+    noisy = stim.Circuit()
+    if data_qubits is None:
+        measured = [0] * circuit.num_qubits
+        for inst in circuit:
+            if inst.name.startswith("M"):
+                for target in inst.targets_copy():
+                    measured[target.qubit_value] += 1
+        data_qubits = {q for q, count in enumerate(measured) if count == 1}
+
+    idle, tick_is_noisy = set(), False
+    for inst in circuit:
+        if isinstance(inst, stim.CircuitRepeatBlock):
+            noisy.append(stim.CircuitRepeatBlock(inst.repeat_count, _insert_uniform_circuit_noise(inst.body_copy(), p, data_qubits, True)))
+            continue
+        targets = inst.targets_copy()
+        idle -= {target.qubit_value for target in targets}
+        if inst.name == "TICK":
+            if idle and tick_is_noisy:
+                noisy.append("DEPOLARIZE1", sorted(idle), p)
+            noisy.append(inst)
+            idle, tick_is_noisy = set(range(noisy.num_qubits)), False
+        elif inst.name in ("MR", "MX"):
+            for target in targets:
+                noiseless = not in_repeat and target.value in data_qubits
+                noisy.append(inst.name, target.value, None if noiseless else p)
+            tick_is_noisy = True
+        elif inst.name in ("R", "RX"):
+            noisy.append(inst)
+            noisy.append("X_ERROR" if inst.name == "R" else "Z_ERROR", targets, p)
+            tick_is_noisy = True
+        elif inst.name == "CX":
+            noisy.append(inst)
+            noisy.append("DEPOLARIZE2", targets, p)
+            tick_is_noisy = True
+        else:
+            noisy.append(inst)
+    if in_repeat and idle and tick_is_noisy:
+        noisy.append("DEPOLARIZE1", sorted(idle), p)
+    return noisy
+
 def generate_surface_interface_yaml(
     distance: int,
     error_rate: float,
     rounds: int = None,
     output_yaml_path: str = None,
     decompose_errors: bool = False,
-    before_round_data_depolarization: float = 0.0
+    noise: str = "uniform_circuit"
 ) -> str:
     """
     Builds Surface code Stim circuit and saves to .interface.yaml
-    The default noise is the Relay-BP paper's: gates, preparation and measurement only.
-    Results from before this default used before_round_data_depolarization=error_rate.
+    noise: "uniform_circuit" = the Relay-BP reference circuits;
+    "stim_generated" = Stim's generated noise with every parameter at error_rate, as in the bposd and lottery results
     """
     if rounds is None or rounds <= 0:
         rounds = distance
 
-    circuit = stim.Circuit.generated(
-        "surface_code:rotated_memory_x",
-        distance=distance,
-        rounds=rounds,
-        after_clifford_depolarization=error_rate,
-        after_reset_flip_probability=error_rate,
-        before_measure_flip_probability=error_rate,
-        before_round_data_depolarization=before_round_data_depolarization
-    )
+    if noise == "uniform_circuit":
+        circuit = _insert_uniform_circuit_noise(
+            stim.Circuit.generated("surface_code:rotated_memory_x", distance=distance, rounds=rounds),
+            error_rate
+        )
+    elif noise == "stim_generated":
+        circuit = stim.Circuit.generated(
+            "surface_code:rotated_memory_x",
+            distance=distance,
+            rounds=rounds,
+            after_clifford_depolarization=error_rate,
+            after_reset_flip_probability=error_rate,
+            before_measure_flip_probability=error_rate,
+            before_round_data_depolarization=error_rate
+        )
+    else:
+        raise ValueError(f"Unknown surface noise <{noise}>.")
 
     data = {
         "interface": {
@@ -607,8 +671,8 @@ if __name__ == "__main__":
     parser.add_argument("-r", "--rounds", type=int, default=0, help="Number of syndrome measurement rounds")
     parser.add_argument("-o", "--output", type=str, default="generated.interface.yaml", help="Output YAML path")
     parser.add_argument("--noise", type=str, default="CIRCUIT_LEVEL", choices=["CIRCUIT_LEVEL", "PHENOMENOLOGICAL"])
-    parser.add_argument("--schedule", type=str, default="ibm", choices=["ibm", "7layer", "7layer_x", "stim", "greedy"],
-                        help="BB circuit: 'ibm' = IBM depth-8 cycle and noise, '7layer' = Stim-convention 7-layer circuit, "
+    parser.add_argument("--schedule", type=str, default="ibm", choices=["ibm", "ibm_xyz", "7layer", "7layer_x", "stim", "greedy"],
+                        help="BB circuit: 'ibm' = IBM depth-8 cycle and noise, 'ibm_xyz' = ibm with X+Z detectors, '7layer' = Stim-convention 7-layer circuit, "
                              "'7layer_x' = 7layer with X detectors only, 'stim' = 7layer with IBM's CNOT order, "
                              "'greedy' = greedy CNOT layering")
     args = parser.parse_args()
